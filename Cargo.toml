@@ -1,0 +1,15 @@
+[package]
+name = "cbot"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ethers = "2.0.14"
+tokio = { version = "1.47.1", features = ["full"] }
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.143"
+reqwest = { version = "0.12.23", features = ["json"] }
+rust_decimal = "1.37.2"
+rust_decimal_macros = "1.37.1"
+chrono = "0.4.41"
+dotenv = "0.15.0"
