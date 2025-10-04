@@ -1,0 +1,24 @@
+[from]
+chain = "arbitrum"
+datasource = "big_query" # big_query or rpc or chifra
+dapp_type = "uniswap" # uniswap/aave/squeeth/uniswap_v4/gmx_v2
+start = "2025-01-01"
+end = "2025-01-03"
+
+[from.uniswap]
+pool_address = "0x6f38e884725a116c9c7fbf208e79fe8828a2595f"
+ignore_position_id = true # Just for uniswap tick files, if set to true, will not download uniswap proxy logs to get position_id. will save a lot of time
+is_token0_base = false # true of false,  # only necessary for ToType==price, e.g. token0 is usdc, token1 is weth, you want value like weth/usdc=3000, then you should set false
+
+[from.big_query] # if you want to download from big query, use this section
+auth_file = "./keys/cbot-470717-f409b95604cf.json" # google bigquery auth file
+
+[to] # output config
+# for uniswap:  raw/minute/tick/position/user_lp/price
+# for aave: raw/minute/tick
+# for gmx: raw/price/tick/pool/minute
+type = "tick" # to file type
+file_type = "parquet" # save file as csv or feather or parquet, default is csv
+save_path = "./data/demeter"
+keep_raw = true # keep raw files in every steps, or only keep final result file. default is false
+skip_existed = true # Skip if the file has existed. default is false

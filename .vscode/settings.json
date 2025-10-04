@@ -7,6 +7,7 @@
       "source.organizeImports.ruff": "explicit"
     }
   },
+  "jupyter.notebookFileRoot": "${workspaceFolder}",
   "ruff.enable": true,
   "ruff.organizeImports": true,
   "ruff.fixAll": true,

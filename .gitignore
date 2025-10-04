@@ -1,2 +1,4 @@
 .env
+keys/
 data/
+__pycache__/
