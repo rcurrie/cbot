@@ -10,46 +10,51 @@ import web3
 from eth_hash.auto import keccak
 
 WETH_ADDRESS = "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2".lower()
-USDC_ADDRESS = "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48".lower()
 
 # %%
-# Get a list of all Uniswap V3 pools on Ethereum with WETH as one of the tokens
-# Downloaded from https://reference-data-api.kaiko.io/v1/pools
+# Filter to only Uniswap V3 pools on Ethereum with WETH as one of the tokens
+# and save utility json lookup files
 with Path("data/pools.json").open() as f:
     pools = json.load(f)["data"]
 
-print(f"DEX pools: {len(pools)}")
+print(f"Pools: {len(pools)}")
 print(f"Protocols: { {p['protocol'] for p in pools} }")
 print(f"Blockchains: { {p['blockchain'] for p in pools} }")
 
-# %%
-# Filter to Ethereium Blockchain and Uniswap V3 pools only
-pools = [p for p in pools if p["blockchain"] == "ethereum" and p["protocol"] == "usp3"]
-print(f"Uniswap V3 pools on Ethereum: {len(pools):,}")
-
-weth_pools = [
-    p for p in pools if any(t["address"].lower() == WETH_ADDRESS for t in p["tokens"])
+# Generate a list of Uniswap V3 pools on Ethereum with WETH
+ethereum_usp3_weth_pools = [
+    p
+    for p in pools
+    if p["blockchain"] == "ethereum"
+    and p["protocol"] == "usp3"
+    and any(t["address"].lower() == WETH_ADDRESS for t in p["tokens"])
 ]
-print(f"Uniswap V3 pools on Ethereum with WETH: {len(weth_pools):,}")
+print(f"Ethereum Uniswap V3 WETH pools: {len(ethereum_usp3_weth_pools):,}")
+with Path("data/ethereum_usp3_weth_pools.json").open("w") as f:
+    json.dump(ethereum_usp3_weth_pools, f, indent=2)
 
-weth_pools_by_address = {p["address"].lower(): p for p in weth_pools}
+weth_pools_by_address = {p["address"].lower(): p for p in ethereum_usp3_weth_pools}
 with Path("data/weth_pools_by_address.json").open("w") as f:
     json.dump(weth_pools_by_address, f, indent=2)
 
-weth_pools_addresses = pl.Series(weth_pools_by_address.keys())
+weth_pools_addresses = pl.Series(
+    [p["address"].lower() for p in ethereum_usp3_weth_pools],
+)
 
 weth_pool_addr_to_symbol = {
     p["address"].lower(): next(
         t["symbol"] for t in p["tokens"] if t["address"].lower() != WETH_ADDRESS
     )
-    for p in weth_pools
+    for p in ethereum_usp3_weth_pools
 }
 with Path("data/weth_pool_addr_to_symbol.json").open("w") as f:
     json.dump(weth_pool_addr_to_symbol, f, indent=2)
 
 
 # %%
-# Uniswap v3 swap event signature and topic hash and data decoder
+# ================================================================================
+# Load and filter swap events to only Ethereum Uniswap V3 WETH pools
+# ================================================================================
 def compute_event_signature(event_signature: str) -> str:
     """Compute the keccak256 hash of an event signature."""
     event_signature_bytes = event_signature.encode("utf-8")
@@ -62,10 +67,6 @@ v3_topic_hash = compute_event_signature(
 )
 print(f"Uniswap V3 Swap event topic hash: {v3_topic_hash}")
 
-# ================================================================================
-# Filter swaps to only Uniswap V3 pools with WETH and hourly activity
-# ================================================================================
-# %%
 # Load previously ingested swap events from Parquet files, columns:
 # block_timestamp,
 # block_number,
@@ -93,58 +94,17 @@ swaps_df = swaps_df.filter(pl.col("topics").list.get(0) == v3_topic_hash).select
     ],
 )
 
-print(f"Total Uniswap V3 swaps: {swaps_df.select(pl.len()).collect().item():,}")
+print(f"Total Uniswap V3 Swaps: {swaps_df.select(pl.len()).collect().item():,}")
 
-# %%
 # Filter to only WETH pools
 swaps_df = swaps_df.filter(pl.col("pool_addr").is_in(weth_pools_addresses.implode()))
-print(f"\nUniswap V3 swaps of WETH pools: {swaps_df.collect().shape[0]:,}")
+print(f"Uniswap V3 Swaps of WETH pools: {swaps_df.collect().shape[0]:,}")
+
 
 # %%
-# Count pools with at least one swap every hour (max gap ≤ 1 hour)
-pools_with_hourly_activity = (
-    swaps_df.collect()
-    .sort(["pool_addr", "block_timestamp"])
-    .with_columns(
-        # Calculate time difference to next swap within each pool
-        pl.col("block_timestamp").diff().over("pool_addr").alias("time_to_next_swap")
-    )
-    .group_by("pool_addr")
-    .agg(
-        # Get maximum time gap between consecutive swaps
-        pl.col("time_to_next_swap").max().alias("max_gap")
-    )
-    .filter(
-        # Filter pools where max gap is <= 1 hour
-        pl.col("max_gap") <= pl.duration(hours=1)
-    )
-)
-
-pools_with_hourly_activity = pools_with_hourly_activity.with_columns(
-    pl.col("pool_addr")
-    .map_elements(
-        lambda addr: weth_pool_addr_to_symbol.get(addr, "UNKNOWN"),
-        return_dtype=pl.String,
-    )
-    .alias("symbol"),
-)
-
-count = pools_with_hourly_activity.select(pl.len()).item()
-print(f"Pools with at least one swap every hour: {count}")
-print("\nPools:")
-print(pools_with_hourly_activity)
-
-# %%
-swaps_df = swaps_df.filter(
-    pl.col("pool_addr").is_in(pools_with_hourly_activity.select("pool_addr").to_series()),
-)
-print(f"\nUniswap V3 swaps from WETH pools with hourly activity: {swaps_df.select(pl.len()).collect().item():,}")
-
-
 # ================================================================================
 # Decode and normalize swap data to human-readable amounts and prices
 # ================================================================================
-# %%
 # Decode swap data and normalize amounts/prices using token decimals
 # The data field contains (non-indexed parameters encoded as ABI):
 # - amount0 (int256): 32 bytes at offset 0
@@ -188,6 +148,7 @@ def decode_and_normalize_swap(
         byteorder="big",
         signed=False,
     )
+    assert sqrt_price_x96 > 0, "sqrtPriceX96 should be positive in a swap"
 
     # Get pool info
     pool = weth_pools_by_address.get(pool_addr.lower())
@@ -238,6 +199,11 @@ def decode_and_normalize_swap(
     # Handle edge cases: log(0) -> -inf, log(negative) -> nan
     log_price_in_weth = math.log(price_in_weth) if price_in_weth > 0 else float("-inf")
 
+    assert amount_weth is not None, "amount_weth should not be null"
+    assert amount_token is not None, "amount_token should not be null"
+    assert price_in_weth is not None, "price_in_weth should not be null"
+    assert log_price_in_weth is not None, "log_price_in_weth should not be null"
+
     return {
         "addr0": token0_addr,
         "addr1": token1_addr,
@@ -247,8 +213,9 @@ def decode_and_normalize_swap(
         "log_price_in_weth": log_price_in_weth,
     }
 
+
 # Decode and normalize in a single pass
-swaps_decoded_df = (
+swaps_df = (
     swaps_df.with_columns(
         pl.struct(["pool_addr", "data"])
         .map_elements(
@@ -277,84 +244,37 @@ swaps_decoded_df = (
     .drop("decoded", "data")
 )
 
-print("\nDecoded WETH swaps with normalized amounts and prices:")
-print(swaps_decoded_df.collect().head())
+# Filter any rows where amount_weth or amount_token is null or non-positive
+swaps_df = swaps_df.filter(
+    (abs(pl.col("amount_weth")) > 0.0) & (abs(pl.col("amount_token")) > 0.0),
+)
+print(f"Non-zero uniswap v3 weth swaps: {swaps_df.collect().shape[0]:,}")
+
 
 # %%
-# Resample to hourly data per pool with complete time grid
-collected_swaps = swaps_decoded_df.collect()
-
-# Get time range
-min_time = collected_swaps.select(pl.col("block_timestamp").min()).item()
-max_time = collected_swaps.select(pl.col("block_timestamp").max()).item()
-
-# Create hourly time grid
-time_grid = pl.datetime_range(
-    min_time.replace(minute=0, second=0, microsecond=0),
-    max_time.replace(minute=0, second=0, microsecond=0),
-    interval="1h",
-    eager=True,
-).alias("block_timestamp")
-
-# Get list of all pools
-all_pools = collected_swaps.select(pl.col("pool_addr").unique()).to_series()
-
-# Create complete grid: all pools × all hours
-complete_grid = pl.DataFrame({"block_timestamp": time_grid}).join(
-    pl.DataFrame({"pool_addr": all_pools}),
-    how="cross",
+# Verify that all log_price_in_weth are finite (not -inf or nan)
+num_invalid_prices = (
+    swaps_df.filter(
+        ~pl.col("log_price_in_weth").is_finite(),
+    )
+    .select(pl.len())
+    .collect()
+    .item()
 )
+print(f"Number of swaps with invalid log_price_in_weth: {num_invalid_prices}")
 
-# Aggregate actual swaps per hour
-hourly_swaps = (
-    collected_swaps.sort("block_timestamp")
-    .with_columns(
-        pl.col("block_timestamp").dt.truncate("1h").alias("hour"),
+# Verify that all the absolute amounts are positive
+num_invalid_amounts = (
+    swaps_df.filter(
+        (pl.col("amount_weth").abs() <= 0.0) | (pl.col("amount_token").abs() <= 0.0),
     )
-    .group_by(["pool_addr", "hour"])
-    .agg(
-        [
-            pl.col("log_price_in_weth").last().alias("log_price"),
-            pl.col("amount_weth").abs().sum().alias("amount_weth_sum"),
-            pl.col("amount_token").abs().sum().alias("amount_token_sum"),
-        ],
-    )
-    .rename({"hour": "block_timestamp"})
+    .select(pl.len())
+    .collect()
+    .item()
 )
-
-# Join with complete grid and forward fill
-hourly_df = (
-    complete_grid.join(hourly_swaps, on=["pool_addr", "block_timestamp"], how="left")
-    .sort(["pool_addr", "block_timestamp"])
-    .with_columns(
-        [
-            # Forward fill log_price per pool
-            pl.col("log_price").forward_fill().over("pool_addr"),
-            # Fill volume columns with 0 where no swaps occurred
-            pl.col("amount_weth_sum").fill_null(0.0),
-            pl.col("amount_token_sum").fill_null(0.0),
-        ],
-    )
-    .with_columns(
-        [
-            # Combined volume
-            (pl.col("amount_weth_sum") + pl.col("amount_token_sum")).alias("volume"),
-        ],
-    )
-    .with_columns(
-        [
-            # Log volume
-            pl.col("volume").log1p().alias("log_volume"),
-        ],
-    )
-)
-
-print("\nHourly resampled data:")
-print(hourly_df.head(5))
+print(f"Number of swaps with non-positive amounts: {num_invalid_amounts}")
 
 # %%
-hourly_df.write_parquet(
-    "data/hourly_weth_swaps.parquet",
-    compression="snappy",
-)
-# %%
+# Save to Parquet
+swaps_df.collect().write_parquet(Path("data/swaps.parquet"))
+print("Saved decoded WETH swaps to data/swaps.parquet")
