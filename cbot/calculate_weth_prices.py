@@ -115,10 +115,83 @@ def calculate_price_from_swap(  # noqa: PLR0913
     return None
 
 
+def filter_price_outliers(df_prices: pl.DataFrame) -> pl.DataFrame:
+    """Filter extreme price outliers per token.
+
+    Remove prices that are > 3x the 99th percentile for each token.
+    Reports outliers found for each token.
+
+    Args:
+        df_prices: DataFrame with price observations.
+
+    Returns:
+        Filtered DataFrame with outliers removed.
+
+    """
+    # Calculate outlier threshold per token (3x 99th percentile)
+    token_thresholds = (
+        df_prices.group_by("token_address")
+        .agg(pl.col("price_in_weth").quantile(0.99).alias("p99"))
+        .with_columns((pl.col("p99") * 3).alias("outlier_threshold"))
+    )
+
+    # Join thresholds back to prices
+    df_with_thresholds = df_prices.join(
+        token_thresholds,
+        on="token_address",
+        how="left",
+    )
+
+    # Identify outliers
+    df_outliers = df_with_thresholds.filter(
+        pl.col("price_in_weth") > pl.col("outlier_threshold"),
+    )
+
+    # Report outliers by token
+    if len(df_outliers) > 0:
+        outlier_summary = (
+            df_outliers.group_by("token_address")
+            .agg([
+                pl.count().alias("count"),
+                pl.col("price_in_weth").min().alias("min_outlier"),
+                pl.col("price_in_weth").max().alias("max_outlier"),
+                pl.col("outlier_threshold").first().alias("threshold"),
+            ])
+            .sort("count", descending=True)
+        )
+
+        logger.info("Found outliers in %d tokens:", len(outlier_summary))
+        for row in outlier_summary.iter_rows(named=True):
+            logger.info(
+                "  %s: %d outliers (threshold: %.6f, range: %.2e - %.2e)",
+                row["token_address"][:10] + "...",
+                row["count"],
+                row["threshold"],
+                row["min_outlier"],
+                row["max_outlier"],
+            )
+
+    # Filter out outliers
+    df_filtered = df_with_thresholds.filter(
+        pl.col("price_in_weth") <= pl.col("outlier_threshold"),
+    ).drop(["p99", "outlier_threshold"])
+
+    n_removed = len(df_prices) - len(df_filtered)
+    logger.info(
+        "Filtered %d outliers (%.3f%% of data)",
+        n_removed,
+        n_removed / len(df_prices) * 100,
+    )
+
+    return df_filtered
+
+
 def calculate_weth_prices(
     input_file: Path,
     output_file: Path,
     pools_file: Path,
+    *,
+    filter_outliers: bool = True,
 ) -> None:
     """Calculate WETH prices from swap data.
 
@@ -126,6 +199,7 @@ def calculate_weth_prices(
         input_file: Input parquet file with WETH-paired swaps.
         output_file: Output parquet file for price time series.
         pools_file: JSON file with WETH pool information (for decimals).
+        filter_outliers: Remove price outliers (> 3x 99th percentile per token).
 
     """
     logger.info("Loading token decimals from %s...", pools_file)
@@ -196,6 +270,11 @@ def calculate_weth_prices(
 
     logger.info("Calculated %s price observations", f"{len(df_prices):,}")
 
+    # Filter outliers if requested
+    if filter_outliers:
+        logger.info("Detecting and filtering outliers...")
+        df_prices = filter_price_outliers(df_prices)
+
     # Save the price time series
     logger.info("Saving to %s...", output_file)
     output_file.parent.mkdir(parents=True, exist_ok=True)
@@ -233,6 +312,11 @@ def calculate_weth_prices(
     help="JSON file with WETH pool information",
 )
 @click.option(
+    "--filter-outliers/--no-filter-outliers",
+    default=True,
+    help="Filter extreme price outliers (default: enabled)",
+)
+@click.option(
     "--verbose",
     is_flag=True,
     help="Enable verbose logging",
@@ -242,6 +326,7 @@ def main(
     output_file: Path,
     pools_file: Path,
     *,
+    filter_outliers: bool,
     verbose: bool,
 ) -> None:
     """Calculate WETH prices from swap data."""
@@ -250,7 +335,12 @@ def main(
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     )
 
-    calculate_weth_prices(input_file, output_file, pools_file)
+    calculate_weth_prices(
+        input_file,
+        output_file,
+        pools_file,
+        filter_outliers=filter_outliers,
+    )
 
 
 if __name__ == "__main__":
