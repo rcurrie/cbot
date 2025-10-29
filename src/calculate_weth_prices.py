@@ -7,6 +7,7 @@ For WETH-paired swaps, calculate direct price from swap amounts.
 import json
 import logging
 from pathlib import Path
+from typing import Any
 
 import click
 import polars as pl
@@ -21,21 +22,18 @@ INT24_SIGN_BIT = 0x800000  # 2^23
 INT24_MAX = 0x1000000  # 2^24
 
 
-def load_token_decimals(pools_file: Path) -> dict[str, int]:
-    """Load token decimals from WETH pools file.
+def load_token_decimals(weth_pools_by_address: dict[str, Any]) -> dict[str, int]:
+    """Load token decimals from WETH pools data.
 
     Args:
-        pools_file: Path to weth_pools_by_address.json file.
+        weth_pools_by_address: Dictionary mapping pool addresses to their data.
 
     Returns:
         Dictionary mapping token_address -> decimals.
 
     """
-    with pools_file.open() as f:
-        weth_pools = json.load(f)
-
     decimals_map = {}
-    for pool in weth_pools.values():
+    for pool in weth_pools_by_address.values():
         for token in pool["tokens"]:
             addr = token["address"].lower()
             decimals_map[addr] = int(token["decimals"])
@@ -95,10 +93,11 @@ def calculate_price_from_swap(  # noqa: PLR0913
         if amount1 == 0:
             return None
         price_in_weth = (
-            abs(amount0) * (10 ** token1_decimals) /
-            (abs(amount1) * (10 ** token0_decimals))
+            abs(amount0)
+            * (10**token1_decimals)
+            / (abs(amount1) * (10**token0_decimals))
         )
-        weth_amount = abs(amount0) / (10 ** token0_decimals)
+        weth_amount = abs(amount0) / (10**token0_decimals)
         return token1_addr, price_in_weth, weth_amount
 
     if token1_addr == WETH_ADDRESS.lower():
@@ -106,10 +105,11 @@ def calculate_price_from_swap(  # noqa: PLR0913
         if amount0 == 0:
             return None
         price_in_weth = (
-            abs(amount1) * (10 ** token0_decimals) /
-            (abs(amount0) * (10 ** token1_decimals))
+            abs(amount1)
+            * (10**token0_decimals)
+            / (abs(amount0) * (10**token1_decimals))
         )
-        weth_amount = abs(amount1) / (10 ** token1_decimals)
+        weth_amount = abs(amount1) / (10**token1_decimals)
         return token0_addr, price_in_weth, weth_amount
 
     return None
@@ -151,12 +151,14 @@ def filter_price_outliers(df_prices: pl.DataFrame) -> pl.DataFrame:
     if len(df_outliers) > 0:
         outlier_summary = (
             df_outliers.group_by("token_address")
-            .agg([
-                pl.count().alias("count"),
-                pl.col("price_in_weth").min().alias("min_outlier"),
-                pl.col("price_in_weth").max().alias("max_outlier"),
-                pl.col("outlier_threshold").first().alias("threshold"),
-            ])
+            .agg(
+                [
+                    pl.count().alias("count"),
+                    pl.col("price_in_weth").min().alias("min_outlier"),
+                    pl.col("price_in_weth").max().alias("max_outlier"),
+                    pl.col("outlier_threshold").first().alias("threshold"),
+                ],
+            )
             .sort("count", descending=True)
         )
 
@@ -189,7 +191,7 @@ def filter_price_outliers(df_prices: pl.DataFrame) -> pl.DataFrame:
 def calculate_weth_prices(
     input_file: Path,
     output_file: Path,
-    pools_file: Path,
+    weth_pools_by_address: dict[str, Any],
     *,
     filter_outliers: bool = True,
 ) -> None:
@@ -198,12 +200,11 @@ def calculate_weth_prices(
     Args:
         input_file: Input parquet file with WETH-paired swaps.
         output_file: Output parquet file for price time series.
-        pools_file: JSON file with WETH pool information (for decimals).
+        weth_pools_by_address: JSON file with WETH pool information (for decimals).
         filter_outliers: Remove price outliers (> 3x 99th percentile per token).
 
     """
-    logger.info("Loading token decimals from %s...", pools_file)
-    decimals_map = load_token_decimals(pools_file)
+    decimals_map = load_token_decimals(weth_pools_by_address)
 
     logger.info("Loading WETH-paired swaps from %s...", input_file)
     df = pl.read_parquet(input_file)
@@ -217,11 +218,13 @@ def calculate_weth_prices(
 
     # Decode amounts using polars expressions for efficiency
     # We'll use a Python UDF for the decoding, then calculate prices
-    df_with_amounts = df.with_columns([
-        # Extract token addresses for decimal lookup
-        pl.col("token0").alias("token0_addr"),
-        pl.col("token1").alias("token1_addr"),
-    ])
+    df_with_amounts = df.with_columns(
+        [
+            # Extract token addresses for decimal lookup
+            pl.col("token0").alias("token0_addr"),
+            pl.col("token1").alias("token1_addr"),
+        ],
+    )
 
     # Process in batches for memory efficiency
     results = []
@@ -229,8 +232,11 @@ def calculate_weth_prices(
 
     for i in range(0, len(df_with_amounts), batch_size):
         batch = df_with_amounts.slice(i, batch_size)
-        logger.info("Processing batch %d/%d...", i // batch_size + 1,
-                    (len(df_with_amounts) + batch_size - 1) // batch_size)
+        logger.info(
+            "Processing batch %d/%d...",
+            i // batch_size + 1,
+            (len(df_with_amounts) + batch_size - 1) // batch_size,
+        )
 
         # Decode amounts for this batch
         decoded_data = []
@@ -245,22 +251,27 @@ def calculate_weth_prices(
 
             # Calculate price
             result = calculate_price_from_swap(
-                amount0, amount1,
-                token0_addr, token1_addr,
-                token0_decimals, token1_decimals,
+                amount0,
+                amount1,
+                token0_addr,
+                token1_addr,
+                token0_decimals,
+                token1_decimals,
             )
 
             if result is not None:
                 token_address, price_in_weth, weth_amount = result
-                decoded_data.append({
-                    "block_timestamp": row["block_timestamp"],
-                    "block_number": row["block_number"],
-                    "transaction_hash": row["transaction_hash"],
-                    "pool": row["pool"],
-                    "token_address": token_address,
-                    "price_in_weth": price_in_weth,
-                    "weth_volume": weth_amount,
-                })
+                decoded_data.append(
+                    {
+                        "block_timestamp": row["block_timestamp"],
+                        "block_number": row["block_number"],
+                        "transaction_hash": row["transaction_hash"],
+                        "pool": row["pool"],
+                        "token_address": token_address,
+                        "price_in_weth": price_in_weth,
+                        "weth_volume": weth_amount,
+                    },
+                )
 
         results.append(pl.DataFrame(decoded_data))
 
@@ -283,11 +294,12 @@ def calculate_weth_prices(
     # Print summary statistics
     logger.info("\nSummary:")
     logger.info("  Unique tokens: %d", df_prices["token_address"].n_unique())
-    logger.info("  Date range: %s to %s",
-                df_prices["block_timestamp"].min(),
-                df_prices["block_timestamp"].max())
-    logger.info("  Total WETH volume: %.2f",
-                df_prices["weth_volume"].sum())
+    logger.info(
+        "  Date range: %s to %s",
+        df_prices["block_timestamp"].min(),
+        df_prices["block_timestamp"].max(),
+    )
+    logger.info("  Total WETH volume: %.2f", df_prices["weth_volume"].sum())
 
     logger.info("Done!")
 
@@ -308,8 +320,8 @@ def calculate_weth_prices(
 @click.option(
     "--pools-file",
     type=click.Path(exists=True, path_type=Path),
-    default=Path("data/weth_pools_by_address.json"),
-    help="JSON file with WETH pool information",
+    default=Path("data/pools.json"),
+    help="JSON file with pool information",
 )
 @click.option(
     "--filter-outliers/--no-filter-outliers",
@@ -335,10 +347,29 @@ def main(
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     )
 
+    with Path(pools_file).open() as f:
+        pools = json.load(f)["data"]
+
+    print(f"Pools: {len(pools)}")
+    print(f"Protocols: { {p['protocol'] for p in pools} }")
+    print(f"Blockchains: { {p['blockchain'] for p in pools} }")
+
+    # Generate a list of Uniswap V3 pools on Ethereum with WETH
+    ethereum_usp3_weth_pools = [
+        p
+        for p in pools
+        if p["blockchain"] == "ethereum"
+        and p["protocol"] == "usp3"
+        and any(t["address"].lower() == WETH_ADDRESS for t in p["tokens"])
+    ]
+    print(f"Ethereum Uniswap V3 WETH pools: {len(ethereum_usp3_weth_pools):,}")
+
+    weth_pools_by_address = {p["address"].lower(): p for p in ethereum_usp3_weth_pools}
+
     calculate_weth_prices(
         input_file,
         output_file,
-        pools_file,
+        weth_pools_by_address,
         filter_outliers=filter_outliers,
     )
 

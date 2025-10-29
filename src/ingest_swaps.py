@@ -199,7 +199,7 @@ def save_to_parquet(
     is_flag=True,
     help="Enable verbose logging (debug level)",
 )
-def main(
+def main(  # noqa: PLR0913
     chain: str,
     start_date: datetime,
     end_date: datetime,
