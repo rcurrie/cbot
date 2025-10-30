@@ -5,20 +5,21 @@
 Build a baseline forecasting workflow that transforms the phase_1 price history into WETH volume bars, derives stationary log-return series, and fits a simple ARIMA(0,1,0) model for 4-hour ahead evaluations. Deliver model artifacts and a benchmarking notebook that compares the ARIMA forecast against a random-walk baseline.
 
 Prerequisites:
+
 - `data/weth_prices_timeseries.parquet` is available from phase_1.
 - Statsmodels and supporting dependencies are installed via `pyproject.toml`.
-- All downstream data artifacts for this phase are written to `./data` and notebooks live under `./` or a dedicated notebooks directory.
+- All downstream data artifacts for this phase are written to `./data` and notebooks live under `./notebooks`.
 
 **Milestone 1: Build Volume Bars**
 
-- **Goal:** Convert the raw time-series into WETH volume bars aligned with the 4-hour prediction horizon.
+- **Goal:** Convert the raw time-series into WETH volume bars aligned with the 4-hour prediction horizon. Note that each of these should be per token as we will be training ARIMA models per token below.
 - **Tasks:**
   1. Load `data/weth_prices_timeseries.parquet` with Polars.
   2. Compute rolling 4-hour WETH volume totals across the dataset.
   3. Derive the median 4-hour volume and use it as the fixed target volume per bar.
   4. Aggregate trades chronologically until the cumulative WETH volume reaches the target, emit a bar, and continue iterating.
   5. Persist the resulting bar series to `data/weth_volume_bars.parquet` with timestamps, open/high/low/close prices, and realized volume.
-- **Validation:** Verify the bar file exists, inspect descriptive stats (e.g., bars per day) to ensure the derived volume keeps bar counts consistent with the 4-hour cadence, and spot-check bar boundaries around known regime shifts.
+- **Validation:** Verify the bar file exists, inspect descriptive stats (e.g., bars per day) for the same representative tokens used in validate_prices.ipynb (USDC, USDT, WBTC, DAI, LINK) to ensure the derived volume keeps bar counts consistent with the 4-hour cadence, and spot-check bar boundaries around known regime shifts.
 
 **Milestone 2: Stationarity Prep and Diagnostics**
 
