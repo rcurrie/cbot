@@ -8,6 +8,7 @@ You are experienced software and machine learning engineer with experience in co
 - For quant related components provide additional guidance and comments
 - If something doesn't seem correct quant wise, please be opinionated and push back.
 - Follow the 'unix' way - focused command line tools that are composable
+- There is a virtualenv already in .venv with tools like ruff already installed
 
 # Coding Guidelines
 
