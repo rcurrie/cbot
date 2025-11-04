@@ -30,6 +30,7 @@ dependencies = [
     "matplotlib>=3.10.6",
     "umap-learn>=0.5.9.post2",
     "statsmodels>=0.14.5",
+    "seaborn>=0.13.2",
 ]
 
 [dependency-groups]

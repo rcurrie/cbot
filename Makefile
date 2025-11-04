@@ -7,6 +7,8 @@ ingest-swaps:
 		--output-dir data/swaps/ \
 		--verbose 
 
+
+# Phase 1: From raw swaps to WETH paired token prices
 filter-swaps:
 	echo "Filtering uniswap v3 swaps..."
 	python src/filter_v3_swaps.py \
@@ -41,8 +43,16 @@ calculate-weth-prices:
 		--verbose
 	echo "Now run validate_prices.ipynb notebook to validate the prices."
 
+# Phase 2: From WETH paired token prices to volume bars and ARIMA forecasts
+generate-volume-bars:
+	python src/generate_volume_bars.py
 
+stationarity-prep:
+	python src/stationarity_prep.py
 
+train-arima-models:
+	python src/train_arima_models.py
+	echo "Run notebooks/validate_arima_models.ipynb to validate ARIMA models."
 
 
 

@@ -31,32 +31,61 @@ Prerequisites:
   4. Save the transformed dataset to `data/weth_volume_bars_log_returns.parquet` with metadata columns (bar timestamp, log price, log return).
 - **Validation:** Confirm diagnostics indicate stationarity, ensure no missing values in the transformed data, and document any anomalies for later review.
 
-**Milestone 3: Train Baseline ARIMA Model**
+**Milestone 3: Train ARIMA Models on Representative Tokens** ✅
 
-- **Goal:** Fit an ARIMA(0,1,0) model on the log price series and produce forecasts aligned with the 4-hour horizon.
+- **Goal:** Create a script that trains ARIMA models on representative tokens from `data/weth_volume_bars_log_returns.parquet` to predict price movements over the next 4-6 volume bars (approximately 4-24 hours).
+- **Status:** COMPLETE - Script successfully trains ARIMA models with command-line options, directional probabilities, and verbose diagnostics.
 - **Tasks:**
-  1. Use `statsmodels` to fit ARIMA(0,1,0) on the log price data.
-  2. Generate out-of-sample forecasts for the next bar and for cumulative 4-hour windows.
-  3. Serialize fitted model parameters and forecasts to `data/arima_baseline_model.json` and `data/arima_baseline_forecasts.parquet` (or equivalent structured formats).
-  4. Capture model diagnostics (residual plots, Ljung-Box statistics) for inclusion in the notebook.
-- **Validation:** Review residual diagnostics for autocorrelation, ensure forecasts are finite and within reasonable bounds, and validate serialization integrity by reloading artifacts in a dry run.
+  1. Create `src/train_arima_models.py` script that:
+     - Loads `data/weth_volume_bars_log_returns.parquet` with filtering capability
+     - Defaults to training on the 5 representative tokens (USDC, USDT, WBTC, DAI, LINK)
+     - For each token, fits an appropriate ARIMA model (start with ARIMA(1,1,1) or use auto-selection) on the log price series
+     - Generates out-of-sample forecasts for the next 4-6 volume bars with:
+       - Predicted log price returns
+       - Confidence intervals (e.g., 80% and 95%) for each prediction
+       - Directional probability (likelihood of positive vs. negative movement)
+     - Produces verbose output showing training progress and model diagnostics
+     - Serializes model artifacts to `data/arima_models/` (per-token parameters) and forecasts to `data/arima_forecasts.parquet`
+  2. Include command-line options to specify:
+     - Which tokens to train on (default: 5 representative tokens)
+     - Forecast horizon (default: 4-6 volume bars)
+     - ARIMA model parameters or auto-selection method
+- **Validation:** Run the script on the 5 representative tokens and verify that models train successfully, produce reasonable forecasts with confidence intervals, and save artifacts correctly. Check that verbose output provides clear diagnostic information.
 
-**Milestone 4: Benchmark Against Random Walk**
+**Milestone 4: Baseline Model Comparison** ✅
 
-- **Goal:** Compare ARIMA forecasts to a random-walk baseline and document results in a notebook.
+- **Goal:** Create a validation notebook that compares ARIMA forecasts against a random-walk baseline for the 5 representative tokens.
+- **Status:** COMPLETE - Comprehensive comparison notebook with metrics, visualizations, and diagnostics successfully created and tested.
 - **Tasks:**
-  1. Define a random-walk baseline using Gaussian shocks scaled to recent log-return volatility.
-  2. Compute performance metrics (MAE, RMSE, directional accuracy) for both ARIMA and the baseline over a held-out period.
-  3. Generate visualizations (time-series overlays, error distributions) highlighting differences.
-  4. Create a notebook `baseline_arima_vs_random_walk.ipynb` that walks through the preprocessing, model fitting, baseline generation, and evaluation.
-  5. Summarize findings, noting where ARIMA outperforms or underperforms the baseline.
-- **Validation:** Ensure the notebook executes top-to-bottom without errors, metrics show ARIMA provides measurable gains over the baseline, and plots render correctly. Document any limitations or edge cases uncovered during evaluation.
+  1. Create `notebooks/arima_baseline_comparison.ipynb` that:
+     - Loads the ARIMA model forecasts from `data/arima_forecasts.parquet` for the 5 representative tokens
+     - Defines a random-walk baseline using Gaussian shocks scaled to recent log-return volatility
+     - Trains both models on a historical training set and evaluates on a held-out test period
+     - Computes performance metrics (MAE, RMSE, directional accuracy) comparing ARIMA forecasts to the random-walk baseline
+     - Generates visualizations showing:
+       - Forecast accuracy over time for each token
+       - Confidence intervals vs. actual outcomes
+       - Directional accuracy comparison (ARIMA vs. baseline)
+     - Documents model diagnostics (residual plots, Ljung-Box statistics) for each representative token
+     - Produces a summary table comparing ARIMA and baseline performance
+- **Validation:** Ensure the notebook executes without errors, visualizations clearly show model performance differences, ARIMA models demonstrate measurable improvement over random-walk baseline in directional accuracy, and confidence intervals are well-calibrated.
 
-**Milestone 5: Phase Wrap-Up and Handoff**
+**Milestone 5: Trading Signal Generation for All Tokens**
 
-- **Goal:** Consolidate outputs, document lessons, and define next steps for more advanced models.
+- **Goal:** Enhance the training script to process all tokens, rank them by trading signal strength, and recommend top 5 tokens for long positions.
 - **Tasks:**
-  1. Assemble a short report capturing data artifacts produced, key metrics, and known gaps.
-  2. Log remaining questions or improvements (e.g., dynamic volume targets, richer feature sets) for future phases.
-  3. Update the project README or dedicated phase tracker with links to artifacts and notebooks.
-- **Validation:** Confirm stakeholders can reproduce results from documentation alone, verify all artifacts are version-controlled or referenced appropriately, and obtain sign-off before advancing to the next modeling phase.
+  1. Extend `src/train_arima_models.py` to:
+     - Support training on all tokens in the dataset (via command-line flag)
+     - Calculate a trading signal score for each token that combines:
+       - High probability of positive price movement over the next 4-6 bars
+       - High confidence (narrow prediction intervals relative to expected return)
+       - Sufficient historical data quality for reliable ARIMA fitting
+     - Rank tokens by trading signal score
+     - Output the top 5 tokens as buy-long candidates for 4-24 hour holding periods
+     - Save ranking results to `data/arima_trading_signals.parquet`
+  2. Ensure the script still defaults to training only the 5 representative tokens for quick validation
+  3. Add logging and output that clearly shows:
+     - Token ranking methodology
+     - Trading signal scores and components for top tokens
+     - Recommended positions with rationale
+- **Validation:** Run the script with the all-tokens flag and verify it processes all tokens efficiently, produces a clear ranking with statistical justification for top 5 tokens, and the default behavior (5 representative tokens only) remains unchanged. Verify forecast horizons align with the 4-24 hour trading window.
