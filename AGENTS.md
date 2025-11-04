@@ -22,6 +22,7 @@ The code must adhere to the following strict standards:
 - Use logging.exception instead of logging.error in exception handlers
 - Always get api keys, passwords etc... from .env via dotenv
 - Any data artifacts should be saved to ./data by default
+- Ignore Ruff warning PLR0913 for main functions that are CLI entry points
 - Use assertions when helpful to keep the code clean and avoid excessive if cases for the data wrangling portions.
 
 **Analyze First**

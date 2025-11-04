@@ -89,7 +89,7 @@ select = ["ALL"]
 ignore = [
     "S101", # Allow using assert
     "T201", # Allow print
-    # "PLR0913", # Allow > 5 arguments to a function
+    "PLR0913", # Allow > 5 arguments to a function
     #     "D203", # Example: Ignore specific docstring rules if needed
     #     "D213", # Example: Ignore conflicting docstring rules
 ]
