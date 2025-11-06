@@ -1,7 +1,7 @@
-"""Calculate WETH prices from decoded swap data.
+"""Calculate USDC prices from decoded swap data.
 
-Process swaps chronologically and calculate the price of each token relative to WETH.
-For WETH-paired swaps, calculate direct price from swap amounts.
+Process swaps chronologically and calculate the price of each token relative to USDC.
+For USDC-paired swaps, calculate direct price from swap amounts.
 """
 
 import json
@@ -14,26 +14,26 @@ import polars as pl
 
 logger = logging.getLogger(__name__)
 
-# WETH contract address on Ethereum mainnet
-WETH_ADDRESS = "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2"
+# USDC contract address on Ethereum mainnet
+USDC_ADDRESS = "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"
 
 # Constants for int24 decoding (3-byte signed integer)
 INT24_SIGN_BIT = 0x800000  # 2^23
 INT24_MAX = 0x1000000  # 2^24
 
 
-def load_token_decimals(weth_pools_by_address: dict[str, Any]) -> dict[str, int]:
-    """Load token decimals from WETH pools data.
+def load_token_decimals(usdc_pools_by_address: dict[str, Any]) -> dict[str, int]:
+    """Load token decimals from USDC pools data.
 
     Args:
-        weth_pools_by_address: Dictionary mapping pool addresses to their data.
+        usdc_pools_by_address: Dictionary mapping pool addresses to their data.
 
     Returns:
         Dictionary mapping token_address -> decimals.
 
     """
     decimals_map = {}
-    for pool in weth_pools_by_address.values():
+    for pool in usdc_pools_by_address.values():
         for token in pool["tokens"]:
             addr = token["address"].lower()
             decimals_map[addr] = int(token["decimals"])
@@ -74,7 +74,7 @@ def calculate_price_from_swap(  # noqa: PLR0913
     token0_decimals: int,
     token1_decimals: int,
 ) -> tuple[str, float, float] | None:
-    """Calculate token price in WETH from swap amounts.
+    """Calculate token price in USDC from swap amounts.
 
     Args:
         amount0: Amount of token0 in the swap.
@@ -85,32 +85,32 @@ def calculate_price_from_swap(  # noqa: PLR0913
         token1_decimals: Token1 decimals.
 
     Returns:
-        Tuple of (token_address, price_in_weth, weth_volume) or None if invalid.
+        Tuple of (token_address, price_in_usdc, usdc_volume) or None if invalid.
 
     """
-    if token0_addr == WETH_ADDRESS.lower():
-        # WETH is token0, price token1 in terms of WETH
+    if token0_addr == USDC_ADDRESS.lower():
+        # USDC is token0, price token1 in terms of USDC
         if amount1 == 0:
             return None
-        price_in_weth = (
+        price_in_usdc = (
             abs(amount0)
             * (10**token1_decimals)
             / (abs(amount1) * (10**token0_decimals))
         )
-        weth_amount = abs(amount0) / (10**token0_decimals)
-        return token1_addr, price_in_weth, weth_amount
+        usdc_amount = abs(amount0) / (10**token0_decimals)
+        return token1_addr, price_in_usdc, usdc_amount
 
-    if token1_addr == WETH_ADDRESS.lower():
-        # WETH is token1, price token0 in terms of WETH
+    if token1_addr == USDC_ADDRESS.lower():
+        # USDC is token1, price token0 in terms of USDC
         if amount0 == 0:
             return None
-        price_in_weth = (
+        price_in_usdc = (
             abs(amount1)
             * (10**token0_decimals)
             / (abs(amount0) * (10**token1_decimals))
         )
-        weth_amount = abs(amount1) / (10**token1_decimals)
-        return token0_addr, price_in_weth, weth_amount
+        usdc_amount = abs(amount1) / (10**token1_decimals)
+        return token0_addr, price_in_usdc, usdc_amount
 
     return None
 
@@ -131,7 +131,7 @@ def filter_price_outliers(df_prices: pl.DataFrame) -> pl.DataFrame:
     # Calculate outlier threshold per token (3x 99th percentile)
     token_thresholds = (
         df_prices.group_by("token_address")
-        .agg(pl.col("price_in_weth").quantile(0.99).alias("p99"))
+        .agg(pl.col("price_in_usdc").quantile(0.99).alias("p99"))
         .with_columns((pl.col("p99") * 3).alias("outlier_threshold"))
     )
 
@@ -144,7 +144,7 @@ def filter_price_outliers(df_prices: pl.DataFrame) -> pl.DataFrame:
 
     # Identify outliers
     df_outliers = df_with_thresholds.filter(
-        pl.col("price_in_weth") > pl.col("outlier_threshold"),
+        pl.col("price_in_usdc") > pl.col("outlier_threshold"),
     )
 
     # Report outliers by token
@@ -154,8 +154,8 @@ def filter_price_outliers(df_prices: pl.DataFrame) -> pl.DataFrame:
             .agg(
                 [
                     pl.count().alias("count"),
-                    pl.col("price_in_weth").min().alias("min_outlier"),
-                    pl.col("price_in_weth").max().alias("max_outlier"),
+                    pl.col("price_in_usdc").min().alias("min_outlier"),
+                    pl.col("price_in_usdc").max().alias("max_outlier"),
                     pl.col("outlier_threshold").first().alias("threshold"),
                 ],
             )
@@ -175,7 +175,7 @@ def filter_price_outliers(df_prices: pl.DataFrame) -> pl.DataFrame:
 
     # Filter out outliers
     df_filtered = df_with_thresholds.filter(
-        pl.col("price_in_weth") <= pl.col("outlier_threshold"),
+        pl.col("price_in_usdc") <= pl.col("outlier_threshold"),
     ).drop(["p99", "outlier_threshold"])
 
     n_removed = len(df_prices) - len(df_filtered)
@@ -188,27 +188,39 @@ def filter_price_outliers(df_prices: pl.DataFrame) -> pl.DataFrame:
     return df_filtered
 
 
-def calculate_weth_prices(
+def calculate_usdc_prices(
     input_file: Path,
     output_file: Path,
-    weth_pools_by_address: dict[str, Any],
+    usdc_pools_by_address: dict[str, Any],
     *,
     filter_outliers: bool = True,
 ) -> None:
-    """Calculate WETH prices from swap data.
+    """Calculate USDC prices from swap data.
 
     Args:
-        input_file: Input parquet file with WETH-paired swaps.
+        input_file: Input parquet file with USDC-paired swaps.
         output_file: Output parquet file for price time series.
-        weth_pools_by_address: JSON file with WETH pool information (for decimals).
+        usdc_pools_by_address: JSON file with USDC pool information (for decimals).
         filter_outliers: Remove price outliers (> 3x 99th percentile per token).
 
     """
-    decimals_map = load_token_decimals(weth_pools_by_address)
+    decimals_map = load_token_decimals(usdc_pools_by_address)
 
-    logger.info("Loading WETH-paired swaps from %s...", input_file)
+    logger.info("Loading USDC-paired swaps from %s...", input_file)
     df = pl.read_parquet(input_file)
     logger.info("Loaded %s swaps", f"{len(df):,}")
+
+    # Analyze USDC coverage in input data
+    logger.info("\nInput Data Analysis:")
+    swaps_with_usdc = df.filter(
+        (pl.col("token0") == USDC_ADDRESS.lower())
+        | (pl.col("token1") == USDC_ADDRESS.lower()),
+    )
+    logger.info(
+        "  Swaps with direct USDC: %s (%.2f%%)",
+        f"{len(swaps_with_usdc):,}",
+        len(swaps_with_usdc) / len(df) * 100 if len(df) > 0 else 0,
+    )
 
     # Sort by timestamp to process chronologically
     logger.info("Sorting swaps chronologically...")
@@ -260,7 +272,7 @@ def calculate_weth_prices(
             )
 
             if result is not None:
-                token_address, price_in_weth, weth_amount = result
+                token_address, price_in_usdc, usdc_amount = result
                 decoded_data.append(
                     {
                         "block_timestamp": row["block_timestamp"],
@@ -268,8 +280,8 @@ def calculate_weth_prices(
                         "transaction_hash": row["transaction_hash"],
                         "pool": row["pool"],
                         "token_address": token_address,
-                        "price_in_weth": price_in_weth,
-                        "weth_volume": weth_amount,
+                        "price_in_usdc": price_in_usdc,
+                        "usdc_volume": usdc_amount,
                     },
                 )
 
@@ -299,7 +311,7 @@ def calculate_weth_prices(
         df_prices["block_timestamp"].min(),
         df_prices["block_timestamp"].max(),
     )
-    logger.info("  Total WETH volume: %.2f", df_prices["weth_volume"].sum())
+    logger.info("  Total USDC volume: %.2f", df_prices["usdc_volume"].sum())
 
     logger.info("Done!")
 
@@ -308,13 +320,13 @@ def calculate_weth_prices(
 @click.option(
     "--input-file",
     type=click.Path(exists=True, path_type=Path),
-    default=Path("data/weth_paired_swaps.parquet"),
-    help="Input parquet file with WETH-paired swaps",
+    default=Path("data/usdc_paired_swaps.parquet"),
+    help="Input parquet file with USDC-paired swaps",
 )
 @click.option(
     "--output-file",
     type=click.Path(path_type=Path),
-    default=Path("data/weth_prices_timeseries.parquet"),
+    default=Path("data/usdc_prices_timeseries.parquet"),
     help="Output parquet file for price time series",
 )
 @click.option(
@@ -341,7 +353,7 @@ def main(
     filter_outliers: bool,
     verbose: bool,
 ) -> None:
-    """Calculate WETH prices from swap data."""
+    """Calculate USDC prices from swap data."""
     logging.basicConfig(
         level=logging.INFO if verbose else logging.WARNING,
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -354,22 +366,22 @@ def main(
     print(f"Protocols: { {p['protocol'] for p in pools} }")
     print(f"Blockchains: { {p['blockchain'] for p in pools} }")
 
-    # Generate a list of Uniswap V3 pools on Ethereum with WETH
-    ethereum_usp3_weth_pools = [
+    # Generate a list of Uniswap V3 pools on Ethereum with USDC
+    ethereum_usp3_usdc_pools = [
         p
         for p in pools
         if p["blockchain"] == "ethereum"
         and p["protocol"] == "usp3"
-        and any(t["address"].lower() == WETH_ADDRESS for t in p["tokens"])
+        and any(t["address"].lower() == USDC_ADDRESS for t in p["tokens"])
     ]
-    print(f"Ethereum Uniswap V3 WETH pools: {len(ethereum_usp3_weth_pools):,}")
+    print(f"Ethereum Uniswap V3 USDC pools: {len(ethereum_usp3_usdc_pools):,}")
 
-    weth_pools_by_address = {p["address"].lower(): p for p in ethereum_usp3_weth_pools}
+    usdc_pools_by_address = {p["address"].lower(): p for p in ethereum_usp3_usdc_pools}
 
-    calculate_weth_prices(
+    calculate_usdc_prices(
         input_file,
         output_file,
-        weth_pools_by_address,
+        usdc_pools_by_address,
         filter_outliers=filter_outliers,
     )
 

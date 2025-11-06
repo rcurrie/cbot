@@ -1,3 +1,4 @@
+# Phase 0: Get swaps and reference data
 ingest-swaps:
 	echo "Ingesting swaps data for July 2025 from Google BigQuery..."
 	python src/ingest-swaps.py \
@@ -7,37 +8,26 @@ ingest-swaps:
 		--output-dir data/swaps/ \
 		--verbose 
 
-
-# Phase 1: From raw swaps to WETH paired token prices
-filter-swaps:
-	echo "Filtering uniswap v3 swaps..."
-	python src/filter_v3_swaps.py \
-		--input-dir data/swaps/ \
-		--output-file data/uniswap_v3_swaps.parquet \
-		--verbose
-
-
-
 ingest-pools:
 	echo "Updating pools.json..."	
 	curl --compressed -H "Accept: application/json" \
 		"https://reference-data-api.kaiko.io/v1/pools" \
 		> data/pools.json
 
-decode-swaps:
-	echo "Decoding uniswap v3 swaps..."
-	python src/decode_swaps.py \
-		--input-file data/uniswap_v3_swaps.parquet \
-		--output-file data/weth_paired_swaps.parquet \
-		--verbose
 
+# Phase 1: From raw swaps to WETH paired token prices
+filter-and-decode-swaps:
+	python src/filter_and_decode_swaps.py \
+	--input-dir data/swaps \
+	--output-file data/usdc_paired_swaps.parquet \
+	--pools-file data/pools.json \
+	--verbose
 
-
-calculate-weth-prices:
-	echo "Calculating WETH paired token prices..."
-	python src/calculate_weth_prices.py \
-		--input-file data/weth_paired_swaps.parquet \
-		--output-file data/weth_prices_timeseries.parquet \
+calculate-usdc-prices:
+	echo "Calculating USDC paired token prices..."
+	python src/calculate_usdc_prices.py \
+		--input-file data/usdc_paired_swaps.parquet \
+		--output-file data/usdc_prices_timeseries.parquet \
 		--pools-file data/pools.json \
 		--filter-outliers \
 		--verbose
@@ -53,7 +43,6 @@ stationarity-prep:
 train-arima-models:
 	python src/train_arima_models.py
 	echo "Run notebooks/validate_arima_models.ipynb to validate ARIMA models."
-
 
 
 
