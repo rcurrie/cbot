@@ -1,53 +1,46 @@
-# Overview
+# Project Context
 
-You are experienced software and machine learning engineer with experience in computational bioinformatics. You have a background in finance but are junior quantative trader (aka quant). You're exploring applying some concepts around embedding space from biology to purely onchain defi towards a developing from scratch a trading system including data ingest, back testing, paper trading and eventualy live trading.
+Building a DeFi trading system from scratch, exploring embedding space concepts from computational biology applied to on-chain trading. The system includes data ingestion, backtesting, paper trading, and eventually live trading.
 
-# General Guidelines
+# Coding Philosophy
 
-- Prioritize simplicity, clarity and reliability
-- For quant related components provide additional guidance and comments
-- If something doesn't seem correct quant wise, please be opinionated and push back.
-- Follow the 'unix' way - focused command line tools that are composable
-- There is a virtualenv already in .venv with tools like ruff already installed
+- **Simplicity and reliability first** - this is a trading system where bugs are costly
+- **Unix philosophy** - focused, composable command-line tools
+- **Be opinionated** - push back on questionable quant approaches
+- **Minimal changes** - touch only what's required, no refactoring unless necessary
 
-# Coding Guidelines
+# Python Standards
 
-The code must adhere to the following strict standards:
+**Type Safety & Linting:**
 
-- All Python code must comply with Ruff's strict linting rules (ALL rules enabled except S101 for assertions).
-- Use uv to run python i.e. uv python src/script.py
-- Jupyter notebooks are configured to run from the root of the project so use data/ to access data artifacts, not ../data
-- Follow strict Mypy typing for all functions, variable and definitions
-- Always prefer `pathlib` over `os.path` for file system operations.
-- Always use a per file logger instead of print without f-strings.
-- Use imperative style for all docstrings.
-- Use logging.exception instead of logging.error in exception handlers
-- Always get api keys, passwords etc... from .env via dotenv
-- Any data artifacts should be saved to ./data by default
-- Ignore Ruff warning PLR0913 for main functions that are CLI entry points
-- Use assertions when helpful to keep the code clean and avoid excessive if cases for the data wrangling portions.
+- Strict Mypy typing for all functions, variables, and definitions
+- Ruff with ALL rules enabled (except S101 for assertions, PLR0913 for CLI entry points)
+- Use Pydantic for data validation
 
-**Analyze First**
+**Code Style:**
 
-- Read the codebase context
-- Find exact insertion points
-- Identify what could break
+- Use `pathlib` over `os.path`
+- Per-file logger instead of print (no f-strings in logging)
+- Imperative style docstrings
+- `logging.exception` in exception handlers, not `logging.error`
+- Assertions are encouraged for cleaner data wrangling code
 
-**Coding Guidelines**
+**Dependencies:**
 
-- Touch only what's required
-- No refactoring, cleanup, or extras unless you feel we should and then propose
-- Follow existing patterns
-- Use python types, pydantic for data validation and strict style conformance - its a trading system so mistakes and bugs can be costly...
-- Use pyton click for command line tools
-- Use polars instead of pandas for data processing
+- Run Python via `uv run python src/script.py`
+- Click for CLI tools
+- Polars for data processing (not pandas)
+- Load secrets from `.env` via dotenv
 
-# Linting and Type Checking
+**Project Structure:**
 
-```bash
-# Run linting with automatic fixes
-ruff check --fix .
+- Save data artifacts to `./data` by default
+- Jupyter notebooks run from project root (use `data/`, not `../data`)
+- Virtual environment is in `.venv` with tools pre-installed
+- One-off validation/debug scripts go in `plans/<milestone_name>/` (not part of main system)
 
-# Run type checking
-mypy .
-```
+# Development Workflow
+
+1. **Before coding:** Read context, identify insertion points, assess what could break
+2. **Run linting:** `ruff check --fix .`
+3. **Run type checking:** `mypy .`
