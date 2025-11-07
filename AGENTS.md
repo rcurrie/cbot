@@ -15,6 +15,8 @@ You are experienced software and machine learning engineer with experience in co
 The code must adhere to the following strict standards:
 
 - All Python code must comply with Ruff's strict linting rules (ALL rules enabled except S101 for assertions).
+- Use uv to run python i.e. uv python src/script.py
+- Jupyter notebooks are configured to run from the root of the project so use data/ to access data artifacts, not ../data
 - Follow strict Mypy typing for all functions, variable and definitions
 - Always prefer `pathlib` over `os.path` for file system operations.
 - Always use a per file logger instead of print without f-strings.

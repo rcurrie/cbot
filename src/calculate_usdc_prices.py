@@ -88,38 +88,53 @@ def calculate_price_from_swap(  # noqa: PLR0913
         Tuple of (token_address, price_in_usdc, usdc_volume) or None if invalid.
 
     """
+    # Minimum USDC volume threshold (0.01 USDC) to avoid extreme prices from dust swaps
+    min_usdc_volume = 0.01
+
     if token0_addr == USDC_ADDRESS.lower():
         # USDC is token0, price token1 in terms of USDC
         if amount1 == 0:
             return None
+
+        usdc_amount = abs(amount0) / (10**token0_decimals)
+
+        # Filter out dust swaps
+        if usdc_amount < min_usdc_volume:
+            return None
+
         price_in_usdc = (
             abs(amount0)
             * (10**token1_decimals)
             / (abs(amount1) * (10**token0_decimals))
         )
-        usdc_amount = abs(amount0) / (10**token0_decimals)
         return token1_addr, price_in_usdc, usdc_amount
 
     if token1_addr == USDC_ADDRESS.lower():
         # USDC is token1, price token0 in terms of USDC
         if amount0 == 0:
             return None
+
+        usdc_amount = abs(amount1) / (10**token1_decimals)
+
+        # Filter out dust swaps
+        if usdc_amount < min_usdc_volume:
+            return None
+
         price_in_usdc = (
             abs(amount1)
             * (10**token0_decimals)
             / (abs(amount0) * (10**token1_decimals))
         )
-        usdc_amount = abs(amount1) / (10**token1_decimals)
         return token0_addr, price_in_usdc, usdc_amount
 
     return None
 
 
 def filter_price_outliers(df_prices: pl.DataFrame) -> pl.DataFrame:
-    """Filter extreme price outliers per token.
+    """Filter extreme price outliers per token using IQR method.
 
-    Remove prices that are > 3x the 99th percentile for each token.
-    Reports outliers found for each token.
+    Remove prices that fall outside 3x the IQR (Interquartile Range) for each token.
+    This catches both high and low outliers, and is more robust than percentile-based.
 
     Args:
         df_prices: DataFrame with price observations.
@@ -128,11 +143,21 @@ def filter_price_outliers(df_prices: pl.DataFrame) -> pl.DataFrame:
         Filtered DataFrame with outliers removed.
 
     """
-    # Calculate outlier threshold per token (3x 99th percentile)
-    token_thresholds = (
-        df_prices.group_by("token_address")
-        .agg(pl.col("price_in_usdc").quantile(0.99).alias("p99"))
-        .with_columns((pl.col("p99") * 3).alias("outlier_threshold"))
+    # Calculate IQR-based thresholds per token
+    token_thresholds = df_prices.group_by("token_address").agg(
+        [
+            pl.col("price_in_usdc").quantile(0.25).alias("q1"),
+            pl.col("price_in_usdc").quantile(0.75).alias("q3"),
+        ],
+    ).with_columns(
+        [
+            (pl.col("q3") - pl.col("q1")).alias("iqr"),
+        ],
+    ).with_columns(
+        [
+            (pl.col("q1") - 3 * pl.col("iqr")).alias("lower_bound"),
+            (pl.col("q3") + 3 * pl.col("iqr")).alias("upper_bound"),
+        ],
     )
 
     # Join thresholds back to prices
@@ -142,9 +167,10 @@ def filter_price_outliers(df_prices: pl.DataFrame) -> pl.DataFrame:
         how="left",
     )
 
-    # Identify outliers
+    # Identify outliers (both high and low)
     df_outliers = df_with_thresholds.filter(
-        pl.col("price_in_usdc") > pl.col("outlier_threshold"),
+        (pl.col("price_in_usdc") < pl.col("lower_bound"))
+        | (pl.col("price_in_usdc") > pl.col("upper_bound")),
     )
 
     # Report outliers by token
@@ -156,7 +182,8 @@ def filter_price_outliers(df_prices: pl.DataFrame) -> pl.DataFrame:
                     pl.count().alias("count"),
                     pl.col("price_in_usdc").min().alias("min_outlier"),
                     pl.col("price_in_usdc").max().alias("max_outlier"),
-                    pl.col("outlier_threshold").first().alias("threshold"),
+                    pl.col("lower_bound").first().alias("lower_bound"),
+                    pl.col("upper_bound").first().alias("upper_bound"),
                 ],
             )
             .sort("count", descending=True)
@@ -165,18 +192,20 @@ def filter_price_outliers(df_prices: pl.DataFrame) -> pl.DataFrame:
         logger.info("Found outliers in %d tokens:", len(outlier_summary))
         for row in outlier_summary.iter_rows(named=True):
             logger.info(
-                "  %s: %d outliers (threshold: %.6f, range: %.2e - %.2e)",
+                "  %s: %d outliers (bounds: %.2e - %.2e, range: %.2e - %.2e)",
                 row["token_address"][:10] + "...",
                 row["count"],
-                row["threshold"],
+                row["lower_bound"],
+                row["upper_bound"],
                 row["min_outlier"],
                 row["max_outlier"],
             )
 
     # Filter out outliers
     df_filtered = df_with_thresholds.filter(
-        pl.col("price_in_usdc") <= pl.col("outlier_threshold"),
-    ).drop(["p99", "outlier_threshold"])
+        (pl.col("price_in_usdc") >= pl.col("lower_bound"))
+        & (pl.col("price_in_usdc") <= pl.col("upper_bound")),
+    ).drop(["q1", "q3", "iqr", "lower_bound", "upper_bound"])
 
     n_removed = len(df_prices) - len(df_filtered)
     logger.info(
