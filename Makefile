@@ -28,7 +28,6 @@ calculate-usdc-prices:
 	python src/calculate_usdc_prices.py \
 		--input-file data/usdc_paired_swaps.parquet \
 		--output-file data/usdc_prices_timeseries.parquet \
-		--pools-file data/pools.json \
 		--filter-outliers \
 		--verbose
 	echo "Now run validate_prices.ipynb notebook to validate the prices."

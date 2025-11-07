@@ -1,12 +1,18 @@
-"""Filter and decode USDC-paired swaps from raw swap data.
+"""Filter USDC-paired swaps from raw swap data.
 
 Load all parquet files from data/swaps/, filter to only Uniswap V3 Swap events
-that involve USDC-paired tokens, and decode the swap data.
+that involve USDC-paired tokens.
+
+This script outputs a parquet file with one row per swap, keeping the raw data
+field for on-demand decoding. It filters to include:
+1. Swaps that have USDC as one of the tokens
+2. Swaps between tokens A and B where both A and B have pools with USDC
 """
 
 import json
 import logging
 from pathlib import Path
+from typing import Any
 
 import click
 import polars as pl
@@ -25,19 +31,134 @@ V3_SWAP_SIGNATURE = Web3.keccak(
     text="Swap(address,address,int256,int256,uint160,uint128,int24)",
 ).hex()
 
+# Constants for int24 decoding (3-byte signed integer)
+INT24_SIGN_BIT = 0x800000  # 2^23
+INT24_MAX = 0x1000000  # 2^24
+
+
+def decode_swap_amounts(data_hex: str) -> tuple[int, int]:
+    """Decode amount0 and amount1 from Uniswap V3 Swap event data.
+
+    Args:
+        data_hex: Hex string of swap event data (with 0x prefix).
+
+    Returns:
+        Tuple of (amount0, amount1).
+
+    """
+    # Remove 0x prefix
+    data = data_hex.removeprefix("0x")
+
+    # Extract 32-byte chunks for amount0 and amount1
+    amount0_hex = data[0:64]
+    amount1_hex = data[64:128]
+
+    # Decode as signed integers
+    amount0 = int.from_bytes(bytes.fromhex(amount0_hex), "big", signed=True)
+    amount1 = int.from_bytes(bytes.fromhex(amount1_hex), "big", signed=True)
+
+    return amount0, amount1
+
+
+def decode_sqrt_price_x96(data_hex: str) -> int:
+    """Decode sqrtPriceX96 from Uniswap V3 Swap event data.
+
+    Args:
+        data_hex: Hex string of swap event data (with 0x prefix).
+
+    Returns:
+        sqrtPriceX96 as an unsigned integer.
+
+    """
+    # Remove 0x prefix
+    data = data_hex.removeprefix("0x")
+
+    # Extract sqrtPriceX96 (bytes 128-192, third 32-byte chunk)
+    sqrt_price_hex = data[128:192]
+
+    # Decode as unsigned integer (uint160)
+    return int.from_bytes(bytes.fromhex(sqrt_price_hex), "big", signed=False)
+
+
+def decode_liquidity(data_hex: str) -> int:
+    """Decode liquidity from Uniswap V3 Swap event data.
+
+    Args:
+        data_hex: Hex string of swap event data (with 0x prefix).
+
+    Returns:
+        Liquidity as an unsigned integer.
+
+    """
+    # Remove 0x prefix
+    data = data_hex.removeprefix("0x")
+
+    # Extract liquidity (bytes 192-256, fourth 32-byte chunk)
+    liquidity_hex = data[192:256]
+
+    # Decode as unsigned integer (uint128)
+    return int.from_bytes(bytes.fromhex(liquidity_hex), "big", signed=False)
+
+
+def decode_tick(data_hex: str) -> int:
+    """Decode tick from Uniswap V3 Swap event data.
+
+    Args:
+        data_hex: Hex string of swap event data (with 0x prefix).
+
+    Returns:
+        Tick as a signed 24-bit integer.
+
+    """
+    # Remove 0x prefix
+    data = data_hex.removeprefix("0x")
+
+    # Extract tick (last 3 bytes of the fifth 32-byte chunk)
+    # The tick is int24, stored in the last 3 bytes
+    tick_hex = data[256 + 58:256 + 64]  # Last 3 bytes (6 hex chars)
+
+    # Decode as signed 24-bit integer
+    tick_unsigned = int.from_bytes(bytes.fromhex(tick_hex), "big", signed=False)
+
+    # Convert to signed int24
+    if tick_unsigned >= INT24_SIGN_BIT:
+        return tick_unsigned - INT24_MAX
+    return tick_unsigned
+
+
+def load_token_decimals(pools: list[dict[str, Any]]) -> dict[str, int]:
+    """Load token decimals from pool data.
+
+    Args:
+        pools: List of pool dictionaries with token information.
+
+    Returns:
+        Dictionary mapping token_address -> decimals.
+
+    """
+    decimals_map = {}
+    for pool in pools:
+        for token in pool.get("tokens", []):
+            addr = token["address"].lower()
+            decimals_map[addr] = int(token["decimals"])
+
+    logger.info("Loaded decimals for %d tokens", len(decimals_map))
+    return decimals_map
+
 
 def load_all_pools(
     pools_file: Path,
-) -> tuple[set[str], dict[str, tuple[str, str]]]:
+) -> tuple[set[str], dict[str, tuple[str, str]], list[dict[str, Any]]]:
     """Load all Uniswap V3 pool information.
 
     Args:
         pools_file: Path to pools.json file (all pools, not just USDC).
 
     Returns:
-        Tuple of (usdc_paired_tokens, all_pool_tokens_map).
+        Tuple of (usdc_paired_tokens, all_pool_tokens_map, uniswap_v3_pools).
         usdc_paired_tokens is set of tokens that have a pool with USDC.
         all_pool_tokens_map maps all pool_address -> (token0, token1).
+        uniswap_v3_pools is the list of all Uniswap V3 pools for decimals.
 
     """
     with pools_file.open() as f:
@@ -75,7 +196,7 @@ def load_all_pools(
 
     logger.info("Found %d unique tokens with USDC pools", len(usdc_paired_tokens))
 
-    return usdc_paired_tokens, all_pool_tokens_map
+    return usdc_paired_tokens, all_pool_tokens_map, uniswap_v3_pools
 
 
 def filter_and_decode_usdc_swaps(
@@ -85,10 +206,10 @@ def filter_and_decode_usdc_swaps(
 ) -> None:
     """Filter and decode USDC-paired swaps from raw swap data.
 
-    Filter strategy: Keep swaps where at least one token has a USDC pool.
-    This includes:
-    - Direct USDC swaps (token <-> USDC)
-    - Indirect swaps (tokenA <-> tokenB) where both have USDC pools
+    Filter strategy:
+    1. Direct USDC swaps: Include any swap where USDC is token0 or token1
+    2. Indirect swaps: Include swaps between tokens A and B where BOTH A and B
+       have direct pools with USDC
 
     Args:
         input_dir: Directory containing input parquet files.
@@ -97,9 +218,14 @@ def filter_and_decode_usdc_swaps(
 
     """
     logger.info("Loading pool information from %s...", pools_file)
-    usdc_paired_tokens, all_pool_tokens_map = load_all_pools(pools_file)
+    usdc_paired_tokens, all_pool_tokens_map, uniswap_v3_pools = load_all_pools(
+        pools_file,
+    )
 
     logger.info("Identified %d tokens with USDC pools", len(usdc_paired_tokens))
+
+    # Load token decimals for later use
+    decimals_map = load_token_decimals(uniswap_v3_pools)
 
     # Create a polars dataframe with ALL pool token mappings for joining
     pool_tokens_df = pl.DataFrame(
@@ -141,15 +267,24 @@ def filter_and_decode_usdc_swaps(
         how="left",
     )
 
-    # Filter to swaps where at least one token has a USDC pool
-    # This includes both direct USDC swaps and swaps between USDC-paired tokens
-    logger.info("Filtering to swaps with USDC-paired tokens...")
+    # Filter to swaps based on USDC connectivity:
+    # 1. Direct USDC swaps: Either token is USDC
+    # 2. Indirect swaps: BOTH tokens have pools with USDC
+    logger.info("Filtering to swaps with USDC connectivity...")
+    usdc_lower = USDC_ADDRESS.lower()
+
     df_filtered = df_with_pools.filter(
-        pl.col("token0").is_in(usdc_paired_tokens | {USDC_ADDRESS.lower()})
-        | pl.col("token1").is_in(usdc_paired_tokens | {USDC_ADDRESS.lower()}),
+        # Direct USDC swaps: either token is USDC
+        (pl.col("token0") == usdc_lower)
+        | (pl.col("token1") == usdc_lower)
+        # Indirect swaps: both tokens have pools with USDC
+        | (
+            pl.col("token0").is_in(usdc_paired_tokens)
+            & pl.col("token1").is_in(usdc_paired_tokens)
+        ),
     )
 
-    logger.info("Filtered to %s swaps with USDC-paired tokens", f"{len(df_filtered):,}")
+    logger.info("Filtered to %s swaps with USDC connectivity", f"{len(df_filtered):,}")
 
     # Decode swap data
     logger.info("Decoding swap events...")
@@ -163,52 +298,73 @@ def filter_and_decode_usdc_swaps(
         pl.col("pool_or_manager_address").str.to_lowercase().alias("pool"),
     ])
 
-    # Select final columns
-    df_decoded = df_decoded.select([
+    # Add token decimals without decoding swap data
+    logger.info("Adding token decimals...")
+    df_final = df_decoded.with_columns([
+        pl.col("token0").map_elements(
+            lambda t: decimals_map.get(t, 18),
+            return_dtype=pl.Int32,
+        ).alias("token0_decimals"),
+        pl.col("token1").map_elements(
+            lambda t: decimals_map.get(t, 18),
+            return_dtype=pl.Int32,
+        ).alias("token1_decimals"),
+    ])
+
+    # Select final columns, keeping raw 'data' field for on-demand decoding
+    df_final = df_final.select([
         "block_timestamp",
         "block_number",
         "transaction_hash",
         "pool",
         "token0",
         "token1",
+        "token0_decimals",
+        "token1_decimals",
         "sender",
         "recipient",
-        "data",
+        "data",  # Keep raw hex data for decoding on-demand
     ])
+
+    # Sort by timestamp
+    df_final = df_final.sort("block_timestamp")
 
     # Analyze USDC coverage
     logger.info("\nUSDC Coverage Analysis:")
-    swaps_with_usdc = df_decoded.filter(
+    swaps_with_usdc = df_final.filter(
         (pl.col("token0") == USDC_ADDRESS.lower())
         | (pl.col("token1") == USDC_ADDRESS.lower()),
     )
-    swaps_without_usdc = df_decoded.filter(
+    swaps_without_usdc = df_final.filter(
         (pl.col("token0") != USDC_ADDRESS.lower())
         & (pl.col("token1") != USDC_ADDRESS.lower()),
     )
 
-    logger.info("  Total swaps: %s", f"{len(df_decoded):,}")
+    logger.info("  Total swaps: %s", f"{len(df_final):,}")
     logger.info(
-        "  Swaps with USDC: %s (%.2f%%)",
+        "  Swaps with direct USDC: %s (%.2f%%)",
         f"{len(swaps_with_usdc):,}",
-        len(swaps_with_usdc) / len(df_decoded) * 100,
+        len(swaps_with_usdc) / len(df_final) * 100 if len(df_final) > 0 else 0,
     )
     logger.info(
-        "  Swaps between non-USDC tokens: %s (%.2f%%)",
+        "  Swaps between USDC-paired tokens: %s (%.2f%%)",
         f"{len(swaps_without_usdc):,}",
-        len(swaps_without_usdc) / len(df_decoded) * 100,
+        len(swaps_without_usdc) / len(df_final) * 100 if len(df_final) > 0 else 0,
     )
 
-    usdc_as_token0 = len(df_decoded.filter(pl.col("token0") == USDC_ADDRESS.lower()))
-    usdc_as_token1 = len(df_decoded.filter(pl.col("token1") == USDC_ADDRESS.lower()))
+    usdc_as_token0 = len(df_final.filter(pl.col("token0") == USDC_ADDRESS.lower()))
+    usdc_as_token1 = len(df_final.filter(pl.col("token1") == USDC_ADDRESS.lower()))
     logger.info("  USDC as token0: %s", f"{usdc_as_token0:,}")
     logger.info("  USDC as token1: %s", f"{usdc_as_token1:,}")
 
     logger.info("\nSaving to %s...", output_file)
     output_file.parent.mkdir(parents=True, exist_ok=True)
-    df_decoded.write_parquet(output_file)
+    df_final.write_parquet(output_file)
 
-    logger.info("Done! Saved %s swaps with USDC-paired tokens", f"{len(df_decoded):,}")
+    logger.info(
+        "Done! Saved %s decoded swaps with USDC connectivity",
+        f"{len(df_final):,}",
+    )
 
 
 @click.command()

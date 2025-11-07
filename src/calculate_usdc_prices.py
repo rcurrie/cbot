@@ -4,10 +4,8 @@ Process swaps chronologically and calculate the price of each token relative to 
 For USDC-paired swaps, calculate direct price from swap amounts.
 """
 
-import json
 import logging
 from pathlib import Path
-from typing import Any
 
 import click
 import polars as pl
@@ -16,30 +14,6 @@ logger = logging.getLogger(__name__)
 
 # USDC contract address on Ethereum mainnet
 USDC_ADDRESS = "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"
-
-# Constants for int24 decoding (3-byte signed integer)
-INT24_SIGN_BIT = 0x800000  # 2^23
-INT24_MAX = 0x1000000  # 2^24
-
-
-def load_token_decimals(usdc_pools_by_address: dict[str, Any]) -> dict[str, int]:
-    """Load token decimals from USDC pools data.
-
-    Args:
-        usdc_pools_by_address: Dictionary mapping pool addresses to their data.
-
-    Returns:
-        Dictionary mapping token_address -> decimals.
-
-    """
-    decimals_map = {}
-    for pool in usdc_pools_by_address.values():
-        for token in pool["tokens"]:
-            addr = token["address"].lower()
-            decimals_map[addr] = int(token["decimals"])
-
-    logger.info("Loaded decimals for %d tokens", len(decimals_map))
-    return decimals_map
 
 
 def decode_swap_amounts(data_hex: str) -> tuple[int, int]:
@@ -66,15 +40,15 @@ def decode_swap_amounts(data_hex: str) -> tuple[int, int]:
     return amount0, amount1
 
 
-def calculate_price_from_swap(  # noqa: PLR0913
+def calculate_direct_price_from_swap(
     amount0: int,
     amount1: int,
     token0_addr: str,
     token1_addr: str,
     token0_decimals: int,
     token1_decimals: int,
-) -> tuple[str, float, float] | None:
-    """Calculate token price in USDC from swap amounts.
+) -> list[dict]:
+    """Calculate token prices in USDC from swap amounts for direct USDC pairs.
 
     Args:
         amount0: Amount of token0 in the swap.
@@ -85,49 +59,49 @@ def calculate_price_from_swap(  # noqa: PLR0913
         token1_decimals: Token1 decimals.
 
     Returns:
-        Tuple of (token_address, price_in_usdc, usdc_volume) or None if invalid.
+        List of price observation dicts. One observation per token in the swap.
 
     """
     # Minimum USDC volume threshold (0.01 USDC) to avoid extreme prices from dust swaps
     min_usdc_volume = 0.01
+    results = []
 
     if token0_addr == USDC_ADDRESS.lower():
         # USDC is token0, price token1 in terms of USDC
-        if amount1 == 0:
-            return None
+        if amount1 != 0:
+            usdc_amount = abs(amount0) / (10**token0_decimals)
 
-        usdc_amount = abs(amount0) / (10**token0_decimals)
+            # Only include if above dust threshold
+            if usdc_amount >= min_usdc_volume:
+                price_in_usdc = (
+                    abs(amount0)
+                    * (10**token1_decimals)
+                    / (abs(amount1) * (10**token0_decimals))
+                )
+                results.append({
+                    "token_address": token1_addr,
+                    "price_in_usdc": price_in_usdc,
+                    "usdc_volume": usdc_amount,
+                })
 
-        # Filter out dust swaps
-        if usdc_amount < min_usdc_volume:
-            return None
-
-        price_in_usdc = (
-            abs(amount0)
-            * (10**token1_decimals)
-            / (abs(amount1) * (10**token0_decimals))
-        )
-        return token1_addr, price_in_usdc, usdc_amount
-
-    if token1_addr == USDC_ADDRESS.lower():
+    elif token1_addr == USDC_ADDRESS.lower() and amount0 != 0:
         # USDC is token1, price token0 in terms of USDC
-        if amount0 == 0:
-            return None
-
         usdc_amount = abs(amount1) / (10**token1_decimals)
 
-        # Filter out dust swaps
-        if usdc_amount < min_usdc_volume:
-            return None
+        # Only include if above dust threshold
+        if usdc_amount >= min_usdc_volume:
+            price_in_usdc = (
+                abs(amount1)
+                * (10**token0_decimals)
+                / (abs(amount0) * (10**token1_decimals))
+            )
+            results.append({
+                "token_address": token0_addr,
+                "price_in_usdc": price_in_usdc,
+                "usdc_volume": usdc_amount,
+            })
 
-        price_in_usdc = (
-            abs(amount1)
-            * (10**token0_decimals)
-            / (abs(amount0) * (10**token1_decimals))
-        )
-        return token0_addr, price_in_usdc, usdc_amount
-
-    return None
+    return results
 
 
 def filter_price_outliers(df_prices: pl.DataFrame) -> pl.DataFrame:
@@ -217,25 +191,25 @@ def filter_price_outliers(df_prices: pl.DataFrame) -> pl.DataFrame:
     return df_filtered
 
 
-def calculate_usdc_prices(
+def calculate_usdc_prices(  # noqa: PLR0915
     input_file: Path,
     output_file: Path,
-    usdc_pools_by_address: dict[str, Any],
     *,
     filter_outliers: bool = True,
 ) -> None:
-    """Calculate USDC prices from swap data.
+    """Calculate USDC prices from decoded swap data.
+
+    Processes swaps chronologically to build a price cache. For direct USDC swaps,
+    calculates prices directly. For indirect swaps (token A <-> token B), uses
+    the most recent USDC prices for both tokens to infer their USDC prices.
 
     Args:
-        input_file: Input parquet file with USDC-paired swaps.
+        input_file: Input parquet file with decoded swaps.
         output_file: Output parquet file for price time series.
-        usdc_pools_by_address: JSON file with USDC pool information (for decimals).
-        filter_outliers: Remove price outliers (> 3x 99th percentile per token).
+        filter_outliers: Remove price outliers (IQR method).
 
     """
-    decimals_map = load_token_decimals(usdc_pools_by_address)
-
-    logger.info("Loading USDC-paired swaps from %s...", input_file)
+    logger.info("Loading decoded swaps from %s...", input_file)
     df = pl.read_parquet(input_file)
     logger.info("Loaded %s swaps", f"{len(df):,}")
 
@@ -251,76 +225,131 @@ def calculate_usdc_prices(
         len(swaps_with_usdc) / len(df) * 100 if len(df) > 0 else 0,
     )
 
-    # Sort by timestamp to process chronologically
-    logger.info("Sorting swaps chronologically...")
-    df = df.sort("block_timestamp")
+    # Data is already sorted by timestamp in filter_and_decode_swaps.py
+    logger.info("Calculating prices from decoded swap amounts...")
+    logger.info("Building price cache for indirect swaps...")
 
-    logger.info("Decoding swap amounts and calculating prices...")
-
-    # Decode amounts using polars expressions for efficiency
-    # We'll use a Python UDF for the decoding, then calculate prices
-    df_with_amounts = df.with_columns(
-        [
-            # Extract token addresses for decimal lookup
-            pl.col("token0").alias("token0_addr"),
-            pl.col("token1").alias("token1_addr"),
-        ],
-    )
+    # Price cache: token_address -> most recent USDC price
+    price_cache: dict[str, float] = {}
+    price_cache[USDC_ADDRESS.lower()] = 1.0  # USDC = 1 USDC
 
     # Process in batches for memory efficiency
     results = []
     batch_size = 100_000
+    indirect_swap_count = 0
+    direct_swap_count = 0
+    skipped_swap_count = 0
 
-    for i in range(0, len(df_with_amounts), batch_size):
-        batch = df_with_amounts.slice(i, batch_size)
+    for i in range(0, len(df), batch_size):
+        batch = df.slice(i, batch_size)
         logger.info(
             "Processing batch %d/%d...",
             i // batch_size + 1,
-            (len(df_with_amounts) + batch_size - 1) // batch_size,
+            (len(df) + batch_size - 1) // batch_size,
         )
 
-        # Decode amounts for this batch
+        # Calculate prices for this batch
         decoded_data = []
         for row in batch.iter_rows(named=True):
-            amount0, amount1 = decode_swap_amounts(row["data"])
+            # Decode swap amounts on-demand
+            try:
+                amount0, amount1 = decode_swap_amounts(row["data"])
+            except (ValueError, IndexError) as e:
+                logger.warning(
+                    "Failed to decode swap at block %s: %s",
+                    row["block_number"],
+                    e,
+                )
+                skipped_swap_count += 1
+                continue
 
             # Get token info
-            token0_addr = row["token0_addr"]
-            token1_addr = row["token1_addr"]
-            token0_decimals = decimals_map.get(token0_addr, 18)
-            token1_decimals = decimals_map.get(token1_addr, 18)
+            token0_addr = row["token0"]
+            token1_addr = row["token1"]
+            token0_decimals = int(row["token0_decimals"])
+            token1_decimals = int(row["token1_decimals"])
 
-            # Calculate price
-            result = calculate_price_from_swap(
-                amount0,
-                amount1,
-                token0_addr,
-                token1_addr,
-                token0_decimals,
-                token1_decimals,
-            )
+            # Check if this is a direct USDC swap
+            usdc_lower = USDC_ADDRESS.lower()
+            is_direct_usdc = usdc_lower in (token0_addr, token1_addr)
 
-            if result is not None:
-                token_address, price_in_usdc, usdc_amount = result
-                decoded_data.append(
-                    {
+            if is_direct_usdc:
+                # Direct USDC swap - calculate price directly
+                price_results = calculate_direct_price_from_swap(
+                    amount0,
+                    amount1,
+                    token0_addr,
+                    token1_addr,
+                    token0_decimals,
+                    token1_decimals,
+                )
+
+                for price_result in price_results:
+                    # Update price cache
+                    price_cache[price_result["token_address"]] = price_result[
+                        "price_in_usdc"
+                    ]
+
+                    # Add to results
+                    decoded_data.append({
                         "block_timestamp": row["block_timestamp"],
                         "block_number": row["block_number"],
                         "transaction_hash": row["transaction_hash"],
                         "pool": row["pool"],
-                        "token_address": token_address,
-                        "price_in_usdc": price_in_usdc,
-                        "usdc_volume": usdc_amount,
-                    },
-                )
+                        "token_address": price_result["token_address"],
+                        "price_in_usdc": price_result["price_in_usdc"],
+                        "usdc_volume": price_result["usdc_volume"],
+                    })
+                    direct_swap_count += 1
 
-        results.append(pl.DataFrame(decoded_data))
+            # Indirect swap - use price cache to infer prices
+            # Both tokens should have USDC prices in cache
+            elif token0_addr in price_cache and token1_addr in price_cache:
+                # Calculate the exchange rate from the swap
+                if amount0 != 0 and amount1 != 0:
+                    # Amount in human-readable form
+                    amount0_real = abs(amount0) / (10**token0_decimals)
+                    amount1_real = abs(amount1) / (10**token1_decimals)
+
+                    # Price of token1 in terms of token0
+                    token1_in_token0 = amount0_real / amount1_real
+
+                    # Use cached USDC price for token0 to infer token1's USDC price
+                    token0_usdc_price = price_cache[token0_addr]
+                    inferred_token1_price = token1_in_token0 * token0_usdc_price
+
+                    # Update cache with inferred price
+                    price_cache[token1_addr] = inferred_token1_price
+
+                    # Estimate USDC volume using token0's price
+                    usdc_volume_estimate = amount0_real * token0_usdc_price
+
+                    # Add price observations for both tokens
+                    decoded_data.append({
+                        "block_timestamp": row["block_timestamp"],
+                        "block_number": row["block_number"],
+                        "transaction_hash": row["transaction_hash"],
+                        "pool": row["pool"],
+                        "token_address": token1_addr,
+                        "price_in_usdc": inferred_token1_price,
+                        "usdc_volume": usdc_volume_estimate,
+                    })
+                    indirect_swap_count += 1
+            else:
+                # Can't price this swap yet - missing price data
+                skipped_swap_count += 1
+
+        if decoded_data:
+            results.append(pl.DataFrame(decoded_data))
 
     # Concatenate all batches
     logger.info("Concatenating results...")
-    df_prices = pl.concat(results)
+    df_prices = pl.concat(results) if results else pl.DataFrame()
 
     logger.info("Calculated %s price observations", f"{len(df_prices):,}")
+    logger.info("  Direct USDC swaps: %s", f"{direct_swap_count:,}")
+    logger.info("  Indirect swaps (inferred): %s", f"{indirect_swap_count:,}")
+    logger.info("  Skipped (no price data): %s", f"{skipped_swap_count:,}")
 
     # Filter outliers if requested
     if filter_outliers:
@@ -350,19 +379,13 @@ def calculate_usdc_prices(
     "--input-file",
     type=click.Path(exists=True, path_type=Path),
     default=Path("data/usdc_paired_swaps.parquet"),
-    help="Input parquet file with USDC-paired swaps",
+    help="Input parquet file with decoded swaps (from filter_and_decode_swaps.py)",
 )
 @click.option(
     "--output-file",
     type=click.Path(path_type=Path),
     default=Path("data/usdc_prices_timeseries.parquet"),
     help="Output parquet file for price time series",
-)
-@click.option(
-    "--pools-file",
-    type=click.Path(exists=True, path_type=Path),
-    default=Path("data/pools.json"),
-    help="JSON file with pool information",
 )
 @click.option(
     "--filter-outliers/--no-filter-outliers",
@@ -377,40 +400,19 @@ def calculate_usdc_prices(
 def main(
     input_file: Path,
     output_file: Path,
-    pools_file: Path,
     *,
     filter_outliers: bool,
     verbose: bool,
 ) -> None:
-    """Calculate USDC prices from swap data."""
+    """Calculate USDC prices from decoded swap data."""
     logging.basicConfig(
         level=logging.INFO if verbose else logging.WARNING,
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     )
 
-    with Path(pools_file).open() as f:
-        pools = json.load(f)["data"]
-
-    print(f"Pools: {len(pools)}")
-    print(f"Protocols: { {p['protocol'] for p in pools} }")
-    print(f"Blockchains: { {p['blockchain'] for p in pools} }")
-
-    # Generate a list of Uniswap V3 pools on Ethereum with USDC
-    ethereum_usp3_usdc_pools = [
-        p
-        for p in pools
-        if p["blockchain"] == "ethereum"
-        and p["protocol"] == "usp3"
-        and any(t["address"].lower() == USDC_ADDRESS for t in p["tokens"])
-    ]
-    print(f"Ethereum Uniswap V3 USDC pools: {len(ethereum_usp3_usdc_pools):,}")
-
-    usdc_pools_by_address = {p["address"].lower(): p for p in ethereum_usp3_usdc_pools}
-
     calculate_usdc_prices(
         input_file,
         output_file,
-        usdc_pools_by_address,
         filter_outliers=filter_outliers,
     )
 
