@@ -9,7 +9,7 @@ ingest-swaps:
 		--verbose 
 
 ingest-pools:
-	echo "Updating pools.json..."	
+	echo "Updating pools.json from kaiko.io..."	
 	curl --compressed -H "Accept: application/json" \
 		"https://reference-data-api.kaiko.io/v1/pools" \
 		> data/pools.json
@@ -32,16 +32,13 @@ calculate-usdc-prices:
 		--verbose
 	echo "Now run validate_prices.ipynb notebook to validate the prices."
 
-# Phase 2: From WETH paired token prices to volume bars and ARIMA forecasts
+# Phase 2: From USDC paired token prices to volume bars and base model
 generate-volume-bars:
-	python src/generate_volume_bars.py
+	python src/generate_pool_bars.py --verbose
 
-stationarity-prep:
-	python src/stationarity_prep.py
 
-train-arima-models:
-	python src/train_arima_models.py
-	echo "Run notebooks/validate_arima_models.ipynb to validate ARIMA models."
+
+
 
 
 
@@ -62,9 +59,9 @@ train-arima-models:
 
 
 # Reference prices for validation notebook
-ingest-uni-prices:
-	echo "Ingesting UNI prices for July 2025..."
-	curl --compressed -H "Accept: application/json" \
-  		"https://api.coingecko.com/api/v3/coins/uni/market_chart/range?vs_currency=eth&from=2025-07-01&to=2025-08-01" \
-		--header "x-cg-pro-api-key: $$COINGECKO_API_KEY" \
-		> data/uni.json
+# ingest-uni-prices:
+# 	echo "Ingesting UNI prices for July 2025..."
+# 	curl --compressed -H "Accept: application/json" \
+#   		"https://api.coingecko.com/api/v3/coins/uni/market_chart/range?vs_currency=eth&from=2025-07-01&to=2025-08-01" \
+# 		--header "x-cg-pro-api-key: $$COINGECKO_API_KEY" \
+# 		> data/uni.json

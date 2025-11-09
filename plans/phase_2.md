@@ -2,90 +2,74 @@
 
 **General Information**
 
-Build a baseline forecasting workflow that transforms the phase_1 price history into WETH volume bars, derives stationary log-return series, and fits a simple ARIMA(0,1,0) model for 4-hour ahead evaluations. Deliver model artifacts and a benchmarking notebook that compares the ARIMA forecast against a random-walk baseline.
+Transform the filtered swaps and usdc time series price files from phase 1 into dollar bars and train a baseline model.
 
-Prerequisites:
+Here are the updated milestones for your coding agent, reflecting the "pool-bar with signed flows" logic.
 
-- `data/weth_prices_timeseries.parquet` is available from phase_1.
-- Statsmodels and supporting dependencies are installed via `pyproject.toml`.
-- All downstream data artifacts for this phase are written to `./data` and notebooks live under `./notebooks`.
+### Milestone 1: Generate Pool-Level Bars and Signed Messages
 
-**Milestone 1: Build Volume Bars**
+- **Inputs:**
+  1. `usdc_paired_swaps.parquet` from phase 1 with a row per swap
+  2. `usdc_prices_timeseries.parquet` with the prices from the swaps converted into usdc as the numéraire
+  3. `pools.json` with information on each pool such as fee
+- **Task:** 2. Define a global `target_usdc_bar_size` via command line with default $100k 3. Group the entire dataset by `pool_id`. 4. For each `pool_id` group: - Iterate through its swaps, sorted by `timestamp`. - Accumulate swaps into a bar until the cumulative `usdc_volume` exceeds `target_usdc_bar_size`. - When a bar is formed, get the `bar_close_timestamp`, `tick_count`, and `bar_time_delta_sec` (time since this pool's _last_ bar). - Inside this bar, determine the two tokens traded (e.g., `Token A` and `Token B`). - Calculate the **signed net flow** for each token: - `net_flow_A` = `sum(usdc_volume where token_in == A)` - `sum(usdc_volume where token_out == A)` - `net_flow_B` = `sum(usdc_volume where token_in == B)` - `sum(usdc_volume where token_out == B)` - Get the `token_a_price` and `token_b_price` from the _last swap_ in the bar (from the prices time series file) - **Generate two output rows** for this single bar event (one for each token). 5. Collect all generated rows from all pools into a single DataFrame.
+- **Output:** A new file, `master_message_log.parquet`.
+- **Output Schema (per row):**
+  - `bar_close_timestamp`: Timestamp of the last swap in the bar.
+  - `pool_id`: The pool that formed the bar.
+  - `token_id`: The token this message is _about_ (e.g., 'ETH').
+  - `net_flow_usdc`: The signed net flow for `token_id` (e.g., `+12,050`).
+  - `token_close_price_usdc`: The USDC price of `token_id` at the end of the bar.
+  - `bar_time_delta_sec`: Time (in seconds) since this _pool's_ last bar.
+  - `tick_count`: Total number of swaps in this bar.
 
-- **Goal:** Convert the raw time-series into WETH volume bars aligned with the 4-hour prediction horizon. Note that each of these should be per token as we will be training ARIMA models per token below.
-- **Tasks:**
-  1. Load `data/weth_prices_timeseries.parquet` with Polars.
-  2. Compute rolling 4-hour WETH volume totals across the dataset.
-  3. Derive the median 4-hour volume and use it as the fixed target volume per bar.
-  4. Aggregate trades chronologically until the cumulative WETH volume reaches the target, emit a bar, and continue iterating.
-  5. Persist the resulting bar series to `data/weth_volume_bars.parquet` with timestamps, open/high/low/close prices, and realized volume.
-- **Validation:** Verify the bar file exists, inspect descriptive stats (e.g., bars per day) for the same representative tokens used in validate_prices.ipynb (USDC, USDT, WBTC, DAI, LINK) to ensure the derived volume keeps bar counts consistent with the 4-hour cadence, and spot-check bar boundaries around known regime shifts.
+---
 
-**Milestone 2: Stationarity Prep and Diagnostics**
+### Milestone 2: Achieve Stationarity for Target Variable
 
-- **Goal:** Produce log price and log-return series suitable for ARIMA modeling.
-- **Tasks:**
-  1. Load the volume bars and compute log prices.
-  2. Generate first-differenced log returns to enforce stationarity.
-  3. Run basic diagnostics (Augmented Dickey-Fuller or similar) to document stationarity assumptions.
-  4. Save the transformed dataset to `data/weth_volume_bars_log_returns.parquet` with metadata columns (bar timestamp, log price, log return).
-- **Validation:** Confirm diagnostics indicate stationarity, ensure no missing values in the transformed data, and document any anomalies for later review.
+- **Input:** `master_message_log.parquet` (from Milestone 1).
+- **Task:**
+  1.  Load the `master_message_log.parquet` file.
+  2.  This file contains the "messages" (features) for the GNN and the raw data for the baseline. The **target variable** for prediction (`token_close_price_usdc`) must be made stationary.
+  3.  Create a new, empty column `y_target_fracdiff`.
+  4.  **Group the DataFrame by `token_id`**.
+  5.  For _each token group_ (e.g., all rows where `token_id == 'ETH'`):
+      - Extract the `token_close_price_usdc` series.
+      - Apply `np.log()` to get `log_price`.
+      - Find the minimum fractional differentiation order `d` (e.g., 0.1-1.0) for _this token's_ `log_price` series that passes the `statsmodels.tsa.stattools.adfuller` test (p-value < 0.05).
+      - Apply this `d` to the `log_price` series to generate `fracdiff_log_price`.
+      - Assign this `fracdiff_log_price` series back to the `y_target_fracdiff` column for the corresponding rows in the main DataFrame.
+  6.  Drop all rows with `NaN` values (which will appear at the start of each token's `fracdiff_log_price` series).
+- **Output:** A new file, `gnn_baseline_features.parquet`. This single file can now be used for both the baseline (by filtering) and the GNN (by using the full graph).
 
-**Milestone 3: Train ARIMA Models on Representative Tokens** ✅
+---
 
-- **Goal:** Create a script that trains ARIMA models on representative tokens from `data/weth_volume_bars_log_returns.parquet` to predict price movements over the next 4-6 volume bars (approximately 4-24 hours).
-- **Status:** COMPLETE - Script successfully trains ARIMA models with command-line options, directional probabilities, and verbose diagnostics.
-- **Tasks:**
-  1. Create `src/train_arima_models.py` script that:
-     - Loads `data/weth_volume_bars_log_returns.parquet` with filtering capability
-     - Defaults to training on the 5 representative tokens (USDC, USDT, WBTC, DAI, LINK)
-     - For each token, fits an appropriate ARIMA model (start with ARIMA(1,1,1) or use auto-selection) on the log price series
-     - Generates out-of-sample forecasts for the next 4-6 volume bars with:
-       - Predicted log price returns
-       - Confidence intervals (e.g., 80% and 95%) for each prediction
-       - Directional probability (likelihood of positive vs. negative movement)
-     - Produces verbose output showing training progress and model diagnostics
-     - Serializes model artifacts to `data/arima_models/` (per-token parameters) and forecasts to `data/arima_forecasts.parquet`
-  2. Include command-line options to specify:
-     - Which tokens to train on (default: 5 representative tokens)
-     - Forecast horizon (default: 4-6 volume bars)
-     - ARIMA model parameters or auto-selection method
-- **Validation:** Run the script on the 5 representative tokens and verify that models train successfully, produce reasonable forecasts with confidence intervals, and save artifacts correctly. Check that verbose output provides clear diagnostic information.
+### Milestone 3: Train and Evaluate Baseline XGBoost Model (Per-Token)
 
-**Milestone 4: Baseline Model Comparison** ✅
-
-- **Goal:** Create a validation notebook that compares ARIMA forecasts against a random-walk baseline for the 5 representative tokens.
-- **Status:** COMPLETE - Comprehensive comparison notebook with metrics, visualizations, and diagnostics successfully created and tested.
-- **Tasks:**
-  1. Create `notebooks/arima_baseline_comparison.ipynb` that:
-     - Loads the ARIMA model forecasts from `data/arima_forecasts.parquet` for the 5 representative tokens
-     - Defines a random-walk baseline using Gaussian shocks scaled to recent log-return volatility
-     - Trains both models on a historical training set and evaluates on a held-out test period
-     - Computes performance metrics (MAE, RMSE, directional accuracy) comparing ARIMA forecasts to the random-walk baseline
-     - Generates visualizations showing:
-       - Forecast accuracy over time for each token
-       - Confidence intervals vs. actual outcomes
-       - Directional accuracy comparison (ARIMA vs. baseline)
-     - Documents model diagnostics (residual plots, Ljung-Box statistics) for each representative token
-     - Produces a summary table comparing ARIMA and baseline performance
-- **Validation:** Ensure the notebook executes without errors, visualizations clearly show model performance differences, ARIMA models demonstrate measurable improvement over random-walk baseline in directional accuracy, and confidence intervals are well-calibrated.
-
-**Milestone 5: Trading Signal Generation for All Tokens**
-
-- **Goal:** Enhance the training script to process all tokens, rank them by trading signal strength, and recommend top 5 tokens for long positions.
-- **Tasks:**
-  1. Extend `src/train_arima_models.py` to:
-     - Support training on all tokens in the dataset (via command-line flag)
-     - Calculate a trading signal score for each token that combines:
-       - High probability of positive price movement over the next 4-6 bars
-       - High confidence (narrow prediction intervals relative to expected return)
-       - Sufficient historical data quality for reliable ARIMA fitting
-     - Rank tokens by trading signal score
-     - Output the top 5 tokens as buy-long candidates for 4-24 hour holding periods
-     - Save ranking results to `data/arima_trading_signals.parquet`
-  2. Ensure the script still defaults to training only the 5 representative tokens for quick validation
-  3. Add logging and output that clearly shows:
-     - Token ranking methodology
-     - Trading signal scores and components for top tokens
-     - Recommended positions with rationale
-- **Validation:** Run the script with the all-tokens flag and verify it processes all tokens efficiently, produces a clear ranking with statistical justification for top 5 tokens, and the default behavior (5 representative tokens only) remains unchanged. Verify forecast horizons align with the 4-24 hour trading window.
+- **Inputs:**
+  1.  `gnn_baseline_features.parquet` (from Milestone 2).
+  2.  `pools.json` (Static pool info file with `pool_id`, `fee_level`, `token0`, `token1`).
+- **Task:**
+  1.  Load `gnn_baseline_features.parquet` and `pools.json`.
+  2.  Merge the static `pools.json` data onto `gnn_baseline_features.parquet` using `pool_id`.
+  3.  **Define a target token** (e.g., `target_token = 'ETH'`).
+  4.  **Create the Baseline Dataset:**
+      - Filter the merged DataFrame for `token_id == target_token`.
+      - Sort this new `token_df` by `bar_close_timestamp`. This is your interleaved time series.
+  5.  **Feature Engineering (`X` and `y`):**
+      - **Target (`y`):** The _next_ stationary price move. `y = token_df['y_target_fracdiff'].shift(-1)`.
+      - **Features (`X`):**
+        - `net_flow_usdc` (current value)
+        - `y_target_fracdiff` (current value, as a feature)
+        - `pool_id` (This _must_ be LabelEncoded for XGBoost).
+        - `bar_time_delta_sec`
+        - `tick_count`
+        - `fee_level` (from `pools.json`)
+        - **(Recommended):** Create lag features: `net_flow_usdc.shift(1)`, `y_target_fracdiff.shift(1)`, etc.
+  6.  Drop all `NaN` rows (from `shift(-1)` and lag features).
+  7.  **Split Data:** Split `X` and `y` into training (first 80%) and testing (last 20%). **Crucially, do not shuffle.**
+  8.  **Train Model:**
+      - Instantiate an `xgboost.XGBRegressor`.
+      - Fit the model on `X_train, y_train`.
+  9.  **Evaluate:** Use `model.predict(X_test)` and compare to `y_test`.
+- **Output:** Print the Mean Squared Error (MSE) and R-squared score for the `target_token` model. Note that this entire Milestone 3 must be repeated for each token you wish to build a baseline for. For this purpose get the token address from a command line parameter and default to WETH.
