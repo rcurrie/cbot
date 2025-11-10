@@ -40,6 +40,10 @@ generate-volume-bars:
 make-stationary:
 	python src/make_stationary.py --verbose
 
+# Phase 3: From stationary prices to labeled data using Triple-Barrier Method
+label-triple-barrier:
+	python src/label_triple_barrier.py --verbose
+
 
 
 

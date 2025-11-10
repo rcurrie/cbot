@@ -4,8 +4,19 @@
 
 Transform the stationary price data from phase 2 into classification labels using the Triple-Barrier Method (TBM). This reframes the prediction problem from regression to classification by labeling each observation based on whether price hits a take-profit barrier, stop-loss barrier, or time limit first.
 
-### Milestone 1: Implement Triple-Barrier Method with Concurrency Handling
+### Milestone 1: Implement Triple-Barrier Method with Concurrency Handling ✅
 
+- **Status:** COMPLETE
+- **Script:** [src/label_triple_barrier.py](../src/label_triple_barrier.py)
+- **Results:**
+  - Total labeled messages: 268,183 (from 270,615 original, 0.6% dropped)
+  - Unique tokens: 38 (51 tokens dropped due to insufficient data)
+  - Label distribution:
+    - Positive labels (+1, take profit hit): 79,324 (29.6%)
+    - Negative labels (-1, stop loss hit): 155,027 (57.8%)
+    - Neutral labels (0, time limit hit): 33,832 (12.6%)
+  - Mean sample weight: 0.179 (indicates healthy label overlap/concurrency)
+  - Sample weight range: 0.038 to 1.000
 - **Input:** `data/log_fracdiff_price.parquet` (from Phase 2 Milestone 2).
 - **Command Line Arguments:**
   - `--upper_multiple` (C1): Multiplier for upper barrier (take profit). Default: 2.0
