@@ -6,8 +6,9 @@ Transform the filtered swaps and usdc time series price files from phase 1 into 
 
 Here are the updated milestones for your coding agent, reflecting the "pool-bar with signed flows" logic.
 
-### Milestone 1: Generate Pool-Level Bars and Signed Messages
+### Milestone 1: Generate Pool-Level Bars and Signed Messages ✅
 
+- **Status:** COMPLETE
 - **Inputs:**
   1. `usdc_paired_swaps.parquet` from phase 1 with a row per swap
   2. `usdc_prices_timeseries.parquet` with the prices from the swaps converted into usdc as the numéraire
@@ -25,8 +26,16 @@ Here are the updated milestones for your coding agent, reflecting the "pool-bar 
 
 ---
 
-### Milestone 2: Achieve Stationarity for Target Variable
+### Milestone 2: Achieve Stationarity for Target Variable ✅
 
+- **Status:** COMPLETE
+- **Script:** [src/make_stationary.py](../src/make_stationary.py)
+- **Results:**
+  - Total messages: 270,615 (from 291,851 original, 7.3% NaN values dropped)
+  - Unique tokens: 89 (6 tokens removed due to insufficient data)
+  - Tokens achieving stationarity: 54/95 (56.8%)
+  - Mean fractional differentiation order (d): 0.660
+  - Median d: 1.000
 - **Input:** `master_message_log.parquet` (from Milestone 1).
 - **Task:**
   1.  Load the `master_message_log.parquet` file.
@@ -40,36 +49,4 @@ Here are the updated milestones for your coding agent, reflecting the "pool-bar 
       - Apply this `d` to the `log_price` series to generate `fracdiff_log_price`.
       - Assign this `fracdiff_log_price` series back to the `y_target_fracdiff` column for the corresponding rows in the main DataFrame.
   6.  Drop all rows with `NaN` values (which will appear at the start of each token's `fracdiff_log_price` series).
-- **Output:** A new file, `gnn_baseline_features.parquet`. This single file can now be used for both the baseline (by filtering) and the GNN (by using the full graph).
-
----
-
-### Milestone 3: Train and Evaluate Baseline XGBoost Model (Per-Token)
-
-- **Inputs:**
-  1.  `gnn_baseline_features.parquet` (from Milestone 2).
-  2.  `pools.json` (Static pool info file with `pool_id`, `fee_level`, `token0`, `token1`).
-- **Task:**
-  1.  Load `gnn_baseline_features.parquet` and `pools.json`.
-  2.  Merge the static `pools.json` data onto `gnn_baseline_features.parquet` using `pool_id`.
-  3.  **Define a target token** (e.g., `target_token = 'ETH'`).
-  4.  **Create the Baseline Dataset:**
-      - Filter the merged DataFrame for `token_id == target_token`.
-      - Sort this new `token_df` by `bar_close_timestamp`. This is your interleaved time series.
-  5.  **Feature Engineering (`X` and `y`):**
-      - **Target (`y`):** The _next_ stationary price move. `y = token_df['y_target_fracdiff'].shift(-1)`.
-      - **Features (`X`):**
-        - `net_flow_usdc` (current value)
-        - `y_target_fracdiff` (current value, as a feature)
-        - `pool_id` (This _must_ be LabelEncoded for XGBoost).
-        - `bar_time_delta_sec`
-        - `tick_count`
-        - `fee_level` (from `pools.json`)
-        - **(Recommended):** Create lag features: `net_flow_usdc.shift(1)`, `y_target_fracdiff.shift(1)`, etc.
-  6.  Drop all `NaN` rows (from `shift(-1)` and lag features).
-  7.  **Split Data:** Split `X` and `y` into training (first 80%) and testing (last 20%). **Crucially, do not shuffle.**
-  8.  **Train Model:**
-      - Instantiate an `xgboost.XGBRegressor`.
-      - Fit the model on `X_train, y_train`.
-  9.  **Evaluate:** Use `model.predict(X_test)` and compare to `y_test`.
-- **Output:** Print the Mean Squared Error (MSE) and R-squared score for the `target_token` model. Note that this entire Milestone 3 must be repeated for each token you wish to build a baseline for. For this purpose get the token address from a command line parameter and default to WETH.
+- **Output:** A new file, `log_fracdiff_price.parquet`. This single file can now be used for both the baseline (by filtering) and the GNN (by using the full graph).

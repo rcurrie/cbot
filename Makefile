@@ -37,6 +37,11 @@ generate-volume-bars:
 	python src/generate_pool_bars.py --verbose
 
 
+make-stationary:
+	python src/make_stationary.py --verbose
+
+
+
 
 
 
