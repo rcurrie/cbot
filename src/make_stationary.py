@@ -12,10 +12,10 @@ This script implements Milestone 2 of Phase 2:
 import logging
 from pathlib import Path
 
-import click
 import numpy as np
 import polars as pl
-from statsmodels.tsa.stattools import adfuller
+import typer
+from statsmodels.tsa.stattools import adfuller  # type: ignore[import-untyped]
 
 logger = logging.getLogger(__name__)
 
@@ -37,7 +37,7 @@ def frac_diff_fixed(
 
     """
     # Compute weights
-    weights = [1.0]
+    weights: list[float] = [1.0]
     k = 1
     while True:
         weight = -weights[-1] * (d - k + 1) / k
@@ -46,13 +46,13 @@ def frac_diff_fixed(
         weights.append(weight)
         k += 1
 
-    weights = np.array(weights[::-1])  # Reverse for convolution
-    width = len(weights)
+    weights_arr = np.array(weights[::-1])  # Reverse for convolution
+    width = len(weights_arr)
 
     # Apply fractional differentiation
     result = np.full(len(series), np.nan)
     for i in range(width - 1, len(series)):
-        result[i] = np.dot(weights, series[i - width + 1 : i + 1])
+        result[i] = np.dot(weights_arr, series[i - width + 1 : i + 1])
 
     return result
 
@@ -84,10 +84,10 @@ def find_min_d_for_stationarity(
     """
     d_values = np.arange(d_min, d_max + d_step, d_step)
 
-    for d in d_values:
+    for d_val in d_values:
         # Test original log_price series or apply fractional differentiation
         fracdiff_series = (
-            log_price if d == 0 else frac_diff_fixed(log_price, d)
+            log_price if float(d_val) == 0 else frac_diff_fixed(log_price, float(d_val))
         )
 
         # Remove NaNs for ADF test
@@ -104,13 +104,98 @@ def find_min_d_for_stationarity(
 
             if p_value < p_value_threshold:
                 # Stationary! Return this d
-                return d, True
-        except Exception as e:
-            logger.warning("ADF test failed for d=%.2f: %s", d, e)
+                return float(d_val), True
+        except (ValueError, RuntimeError) as e:
+            logger.warning("ADF test failed for d=%.2f: %s", d_val, e)
             continue
 
     # No stationary d found
-    return d_max, False
+    return float(d_max), False
+
+
+def _process_token_group(
+    token_id: str,
+    token_df: pl.DataFrame,
+    d_min: float,
+    d_max: float,
+    d_step: float,
+) -> tuple[pl.DataFrame | None, dict[str, object]]:
+    """Process a single token group for stationarity.
+
+    Args:
+        token_id: Token identifier.
+        token_df: DataFrame for this token.
+        d_min: Minimum d to search.
+        d_max: Maximum d to search.
+        d_step: Step size for d search.
+
+    Returns:
+        Tuple of (processed_df, token_stats_dict). processed_df is None if token
+        should be skipped.
+
+    """
+    # Get price series
+    prices = token_df["token_close_price_usdc"].to_numpy()
+
+    # Apply log transformation
+    log_prices = np.log(prices)
+
+    # Check if log_prices are valid
+    if np.any(np.isnan(log_prices)) or np.any(np.isinf(log_prices)):
+        logger.warning("Token %s has invalid log prices, skipping", token_id)
+        return (
+            None,
+            {
+                "token_id": token_id,
+                "n_observations": len(token_df),
+                "min_d": 0.0,
+                "is_stationary": False,
+                "n_valid_after_fracdiff": 0,
+                "dropped": True,
+            },
+        )
+
+    # Find minimum d for stationarity
+    min_d, is_stationary = find_min_d_for_stationarity(
+        log_prices,
+        d_min=d_min,
+        d_max=d_max,
+        d_step=d_step,
+    )
+
+    stats: dict[str, object] = {
+        "token_id": token_id,
+        "n_observations": len(token_df),
+        "min_d": float(min_d),
+        "is_stationary": is_stationary,
+        "dropped": False,
+    }
+
+    if not is_stationary:
+        logger.info(
+            "Token %s not stationary (d=%.2f)",
+            token_id[:10] + "...",
+            min_d,
+        )
+        stats["n_valid_after_fracdiff"] = 0
+        stats["dropped"] = True
+        return None, stats
+
+    # Apply fractional differentiation with the found d
+    if min_d == 0:
+        fracdiff_log_price = log_prices
+    else:
+        fracdiff_log_price = frac_diff_fixed(log_prices, min_d)
+
+    # Store statistics
+    stats["n_valid_after_fracdiff"] = int(np.sum(~np.isnan(fracdiff_log_price)))
+
+    # Add fracdiff values to token_df
+    result_df = token_df.with_columns(
+        [pl.Series("y_target_fracdiff", fracdiff_log_price)],
+    )
+
+    return result_df, stats
 
 
 def make_stationary(
@@ -141,9 +226,6 @@ def make_stationary(
         df["token_id"].n_unique(),
     )
 
-    # Create empty column for y_target_fracdiff
-    df = df.with_columns([pl.lit(None, dtype=pl.Float64).alias("y_target_fracdiff")])
-
     # Sort by token_id and timestamp for proper time series processing
     df = df.sort(["token_id", "bar_close_timestamp"])
 
@@ -156,75 +238,28 @@ def make_stationary(
     )
 
     # Process each token group
-    all_fracdiff_rows = []
-    token_stats = []
+    all_fracdiff_rows: list[pl.DataFrame] = []
+    token_stats: list[dict[str, object]] = []
 
     for token_tuple, token_group in df.group_by("token_id", maintain_order=True):
         token_id = token_tuple[0]  # Extract scalar from tuple
         token_df = token_group.sort("bar_close_timestamp")
 
-        # Get price series
-        prices = token_df["token_close_price_usdc"].to_numpy()
-
-        # Apply log transformation
-        log_prices = np.log(prices)
-
-        # Check if log_prices are valid
-        if np.any(np.isnan(log_prices)) or np.any(np.isinf(log_prices)):
-            logger.warning("Token %s has invalid log prices, skipping", token_id)
-            continue
-
-        # Find minimum d for stationarity
-        min_d, is_stationary = find_min_d_for_stationarity(
-            log_prices,
-            d_min=d_min,
-            d_max=d_max,
-            d_step=d_step,
+        result_df, stats = _process_token_group(
+            token_id,
+            token_df,
+            d_min,
+            d_max,
+            d_step,
         )
+        token_stats.append(stats)
 
-        # Skip token if not stationary and drop_non_stationary is True
-        if drop_non_stationary and not is_stationary:
-            logger.info(
-                "Dropping token %s (not stationary, d=%.2f)",
-                token_id[:10] + "...",
-                min_d,
-            )
-            token_stats.append(
-                {
-                    "token_id": token_id,
-                    "n_observations": len(token_df),
-                    "min_d": min_d,
-                    "is_stationary": is_stationary,
-                    "n_valid_after_fracdiff": 0,
-                    "dropped": True,
-                }
-            )
-            continue
-
-        # Apply fractional differentiation with the found d
-        if min_d == 0:
-            fracdiff_log_price = log_prices
-        else:
-            fracdiff_log_price = frac_diff_fixed(log_prices, min_d)
-
-        # Store statistics
-        token_stats.append(
-            {
-                "token_id": token_id,
-                "n_observations": len(token_df),
-                "min_d": min_d,
-                "is_stationary": is_stationary,
-                "n_valid_after_fracdiff": np.sum(~np.isnan(fracdiff_log_price)),
-                "dropped": False,
-            }
+        should_include = result_df is not None and (
+            not drop_non_stationary or stats["is_stationary"]
         )
-
-        # Add fracdiff values to token_df and collect rows
-        all_fracdiff_rows.append(
-            token_df.with_columns(
-                [pl.Series("y_target_fracdiff", fracdiff_log_price)],
-            ),
-        )
+        if should_include:
+            assert result_df is not None
+            all_fracdiff_rows.append(result_df)
 
     # Combine all token dataframes
     logger.info("\nCombining results from all tokens...")
@@ -239,10 +274,30 @@ def make_stationary(
     logger.info(
         "Dropped %s rows with NaN values (%.1f%%)",
         f"{n_dropped:,}",
-        100 * n_dropped / n_before,
+        100 * n_dropped / n_before if n_before > 0 else 0,
     )
 
     # Log statistics
+    _log_stationarity_stats(token_stats, drop_non_stationary)
+    _log_output_stats(result_df)
+
+    # Save output
+    logger.info("\nSaving to %s...", output_file)
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+    result_df.write_parquet(output_file)
+
+    logger.info(
+        "Done! Saved %s messages to %s",
+        f"{len(result_df):,}",
+        output_file.name,
+    )
+
+
+def _log_stationarity_stats(
+    token_stats: list[dict[str, object]],
+    drop_non_stationary: bool,
+) -> None:
+    """Log stationarity statistics."""
     stats_df = pl.DataFrame(token_stats)
     logger.info("\nStationarity Statistics:")
     logger.info("  Total tokens processed: %d", len(stats_df))
@@ -273,7 +328,9 @@ def make_stationary(
             row["is_stationary"],
         )
 
-    # Final output statistics
+
+def _log_output_stats(result_df: pl.DataFrame) -> None:
+    """Log final output dataset statistics."""
     logger.info("\nOutput Dataset:")
     logger.info("  Total messages: %s", f"{len(result_df):,}")
     logger.info("  Unique tokens: %d", result_df["token_id"].n_unique())
@@ -284,73 +341,136 @@ def make_stationary(
         result_df["bar_close_timestamp"].max(),
     )
 
-    # Save output
-    logger.info("\nSaving to %s...", output_file)
-    output_file.parent.mkdir(parents=True, exist_ok=True)
-    result_df.write_parquet(output_file)
 
-    logger.info(
-        "Done! Saved %s messages to %s",
-        f"{len(result_df):,}",
-        output_file.name,
-    )
-
-
-@click.command()
-@click.option(
-    "--input-file",
-    type=click.Path(exists=True, path_type=Path),
-    default=Path("data/master_message_log.parquet"),
-    help="Input master_message_log.parquet file",
-)
-@click.option(
-    "--output-file",
-    type=click.Path(path_type=Path),
-    default=Path("data/log_fracdiff_price.parquet"),
-    help="Output parquet file path",
-)
-@click.option(
-    "--d-min",
-    type=float,
-    default=0.0,
-    help="Minimum fractional differentiation order",
-)
-@click.option(
-    "--d-max",
-    type=float,
-    default=1.0,
-    help="Maximum fractional differentiation order",
-)
-@click.option(
-    "--d-step",
-    type=float,
-    default=0.05,
-    help="Step size for d search",
-)
-@click.option(
-    "--drop-non-stationary",
-    is_flag=True,
-    help="Drop tokens that don't achieve stationarity",
-)
-@click.option(
-    "--verbose",
-    is_flag=True,
-    help="Enable verbose logging",
-)
-def main(
-    input_file: Path,
+def validate_output(
     output_file: Path,
-    d_min: float,
-    d_max: float,
-    d_step: float,
-    *,
-    drop_non_stationary: bool,
-    verbose: bool,
+) -> None:
+    """Validate the generated output parquet file.
+
+    Checks:
+    - File exists
+    - Has required columns
+    - Data types are correct
+    - No unexpected NaN values
+    - Statistics look reasonable
+
+    Args:
+        output_file: Path to the output parquet file.
+
+    Raises:
+        RuntimeError: If validation fails.
+
+    """
+    logger.info("Validating output file %s...", output_file)
+
+    if not output_file.exists():
+        msg = f"Output file does not exist: {output_file}"
+        raise RuntimeError(msg)
+
+    df = pl.read_parquet(output_file)
+    logger.info("  Loaded %s rows", f"{len(df):,}")
+
+    # Check required columns
+    required_cols = {
+        "token_id",
+        "pool_id",
+        "bar_close_timestamp",
+        "token_close_price_usdc",
+        "y_target_fracdiff",
+    }
+    missing_cols = required_cols - set(df.columns)
+    if missing_cols:
+        msg = f"Missing required columns: {missing_cols}"
+        raise RuntimeError(msg)
+    logger.info("  ✓ All required columns present")
+
+    # Check data types
+    logger.info("  Column data types:")
+    for col in ["y_target_fracdiff", "token_close_price_usdc"]:
+        dtype = df.select(col).dtypes[0]
+        logger.info("    %s: %s", col, dtype)
+
+    # Check for NaNs in critical columns
+    nan_counts: dict[str, int] = {}
+    for col_name in ["token_id", "pool_id", "y_target_fracdiff"]:
+        nan_count = df.filter(pl.col(col_name).is_null()).height
+        nan_counts[col_name] = nan_count
+        if nan_count > 0:
+            logger.warning("    %s has %d NaN values", col_name, nan_count)
+    logger.info("  ✓ NaN check complete: %s", nan_counts)
+
+    # Check y_target_fracdiff statistics
+    fracdiff_stats = df.select(
+        [
+            pl.col("y_target_fracdiff").min().alias("min"),
+            pl.col("y_target_fracdiff").max().alias("max"),
+            pl.col("y_target_fracdiff").mean().alias("mean"),
+            pl.col("y_target_fracdiff").std().alias("std"),
+        ],
+    )
+    logger.info("  y_target_fracdiff statistics:")
+    for row in fracdiff_stats.iter_rows(named=True):
+        logger.info(
+            "    min=%.4f, max=%.4f, mean=%.6f, std=%.6f",
+            row["min"],
+            row["max"],
+            row["mean"],
+            row["std"],
+        )
+
+    # Check unique token counts
+    n_tokens = df["token_id"].n_unique()
+    n_pools = df["pool_id"].n_unique()
+    logger.info("  ✓ Unique tokens: %d", n_tokens)
+    logger.info("  ✓ Unique pools: %d", n_pools)
+
+    # Check date range
+    date_min = df["bar_close_timestamp"].min()
+    date_max = df["bar_close_timestamp"].max()
+    logger.info("  ✓ Date range: %s to %s", date_min, date_max)
+
+    logger.info("✓ Validation passed!")
+
+
+def main(
+    input_file: Path = typer.Option(
+        Path("data/master_message_log.parquet"),
+        help="Input master_message_log.parquet file",
+    ),
+    output_file: Path = typer.Option(
+        Path("data/log_fracdiff_price.parquet"),
+        help="Output parquet file path",
+    ),
+    d_min: float = typer.Option(
+        0.0,
+        help="Minimum fractional differentiation order",
+    ),
+    d_max: float = typer.Option(
+        1.0,
+        help="Maximum fractional differentiation order",
+    ),
+    d_step: float = typer.Option(
+        0.05,
+        help="Step size for d search",
+    ),
+    drop_non_stationary: bool = typer.Option(
+        False,
+        help="Drop tokens that don't achieve stationarity",
+    ),
+    validate: bool = typer.Option(
+        False,
+        help="Run validation on the generated output",
+    ),
+    verbose: bool = typer.Option(
+        False,
+        help="Enable verbose logging",
+    ),
 ) -> None:
     """Make target variable stationary using fractional differentiation."""
     logging.basicConfig(
         level=logging.INFO if verbose else logging.WARNING,
-        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+        format="%(asctime)s %(levelname)s %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
     )
 
     make_stationary(
@@ -362,6 +482,9 @@ def main(
         drop_non_stationary=drop_non_stationary,
     )
 
+    if validate:
+        validate_output(output_file)
+
 
 if __name__ == "__main__":
-    main()
+    typer.run(main)
