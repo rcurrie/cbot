@@ -19,11 +19,12 @@ filter-and-decode-swaps:
 	python src/filter_and_decode_swaps.py --verbose
 
 calculate-usdc-prices:
-	python src/calculate_usdc_prices.py --verbose
+	python src/calculate_usdc_prices.py --verbose --validate
 
 
 generate-volume-bars:
-	python src/generate_pool_bars.py --verbose
+	python src/generate_pool_bars.py --verbose --validate
+
 
 
 make-stationary:

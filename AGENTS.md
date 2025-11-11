@@ -24,6 +24,7 @@ RULE NUMBER 1 (NEVER EVER EVER FORGET THIS RULE!!!): YOU ARE NEVER ALLOWED TO DE
 
 # Python Standards
 
+- Use uv to run all command line tools
 - Only use uv, NEVER pip.
 - Virtual env managed by uv in .venv which you can assume is activated
 - Python 3.14 and higher (NOT pip/poetry/conda!)

@@ -638,7 +638,8 @@ def main(
     """Calculate USDC prices from decoded swap data."""
     logging.basicConfig(
         level=logging.INFO if verbose else logging.WARNING,
-        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+        format="%(asctime)s %(levelname)s %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
     )
 
     calculate_usdc_prices(
