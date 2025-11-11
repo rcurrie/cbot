@@ -15,24 +15,13 @@ ingest-pools:
 		> data/pools.json
 
 
-# Phase 1: From raw swaps to WETH paired token prices
 filter-and-decode-swaps:
-	python src/filter_and_decode_swaps.py \
-	--input-dir data/swaps \
-	--output-file data/usdc_paired_swaps.parquet \
-	--pools-file data/pools.json \
-	--verbose
+	python src/filter_and_decode_swaps.py --verbose
 
 calculate-usdc-prices:
-	echo "Calculating USDC paired token prices..."
-	python src/calculate_usdc_prices.py \
-		--input-file data/usdc_paired_swaps.parquet \
-		--output-file data/usdc_prices_timeseries.parquet \
-		--filter-outliers \
-		--verbose
-	echo "Now run validate_prices.ipynb notebook to validate the prices."
+	python src/calculate_usdc_prices.py --verbose
 
-# Phase 2: From USDC paired token prices to volume bars and base model
+
 generate-volume-bars:
 	python src/generate_pool_bars.py --verbose
 

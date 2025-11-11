@@ -3,6 +3,8 @@ name = "cbot"
 version = "0.1.0"
 requires-python = ">=3.14"
 dependencies = [
+    "dotenv>=0.9.9",
+    "matplotlib>=3.10.7",
     "numpy>=2.3.4",
     # "aiohttp>=3.12.15",
     # "dotenv>=0.9.9",
@@ -33,6 +35,7 @@ dependencies = [
     # "google-cloud-bigquery-storage>=2.27.0",
     # "dask>=2025.9.1",
     "polars>=1.35.2",
+    "requests>=2.32.5",
     "typer>=0.20.0",
     "web3>=7.14.0",
 ]

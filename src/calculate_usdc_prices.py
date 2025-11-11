@@ -4,16 +4,36 @@ Process swaps chronologically and calculate the price of each token relative to 
 For USDC-paired swaps, calculate direct price from swap amounts.
 """
 
+import json
 import logging
+import os
+from datetime import UTC, datetime
 from pathlib import Path
+from typing import TypedDict, cast
 
-import click
 import polars as pl
+import requests
+import typer
+from dotenv import load_dotenv
 
 logger = logging.getLogger(__name__)
 
+
+class PriceObservation(TypedDict):
+    """Price observation for a token."""
+
+    token_address: str
+    price_in_usdc: float
+    usdc_volume: float
+
+
 # USDC contract address on Ethereum mainnet
 USDC_ADDRESS = "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"
+
+# CoinGecko API configuration
+load_dotenv()
+COINGECKO_API_KEY = os.getenv("COINGECKO_API_KEY")
+VALIDATION_TOKENS_FILE = Path("validation_tokens.json")
 
 
 def decode_swap_amounts(data_hex: str) -> tuple[int, int]:
@@ -47,7 +67,7 @@ def calculate_direct_price_from_swap(
     token1_addr: str,
     token0_decimals: int,
     token1_decimals: int,
-) -> list[dict]:
+) -> list[PriceObservation]:
     """Calculate token prices in USDC from swap amounts for direct USDC pairs.
 
     Args:
@@ -64,7 +84,7 @@ def calculate_direct_price_from_swap(
     """
     # Minimum USDC volume threshold (0.01 USDC) to avoid extreme prices from dust swaps
     min_usdc_volume = 0.01
-    results = []
+    results: list[PriceObservation] = []
 
     if token0_addr == USDC_ADDRESS.lower():
         # USDC is token0, price token1 in terms of USDC
@@ -78,11 +98,16 @@ def calculate_direct_price_from_swap(
                     * (10**token1_decimals)
                     / (abs(amount1) * (10**token0_decimals))
                 )
-                results.append({
-                    "token_address": token1_addr,
-                    "price_in_usdc": price_in_usdc,
-                    "usdc_volume": usdc_amount,
-                })
+                results.append(
+                    cast(
+                        "PriceObservation",
+                        {
+                            "token_address": token1_addr,
+                            "price_in_usdc": price_in_usdc,
+                            "usdc_volume": usdc_amount,
+                        },
+                    ),
+                )
 
     elif token1_addr == USDC_ADDRESS.lower() and amount0 != 0:
         # USDC is token1, price token0 in terms of USDC
@@ -95,11 +120,16 @@ def calculate_direct_price_from_swap(
                 * (10**token0_decimals)
                 / (abs(amount0) * (10**token1_decimals))
             )
-            results.append({
-                "token_address": token0_addr,
-                "price_in_usdc": price_in_usdc,
-                "usdc_volume": usdc_amount,
-            })
+            results.append(
+                cast(
+                    "PriceObservation",
+                    {
+                        "token_address": token0_addr,
+                        "price_in_usdc": price_in_usdc,
+                        "usdc_volume": usdc_amount,
+                    },
+                ),
+            )
 
     return results
 
@@ -118,20 +148,25 @@ def filter_price_outliers(df_prices: pl.DataFrame) -> pl.DataFrame:
 
     """
     # Calculate IQR-based thresholds per token
-    token_thresholds = df_prices.group_by("token_address").agg(
-        [
-            pl.col("price_in_usdc").quantile(0.25).alias("q1"),
-            pl.col("price_in_usdc").quantile(0.75).alias("q3"),
-        ],
-    ).with_columns(
-        [
-            (pl.col("q3") - pl.col("q1")).alias("iqr"),
-        ],
-    ).with_columns(
-        [
-            (pl.col("q1") - 3 * pl.col("iqr")).alias("lower_bound"),
-            (pl.col("q3") + 3 * pl.col("iqr")).alias("upper_bound"),
-        ],
+    token_thresholds = (
+        df_prices.group_by("token_address")
+        .agg(
+            [
+                pl.col("price_in_usdc").quantile(0.25).alias("q1"),
+                pl.col("price_in_usdc").quantile(0.75).alias("q3"),
+            ],
+        )
+        .with_columns(
+            [
+                (pl.col("q3") - pl.col("q1")).alias("iqr"),
+            ],
+        )
+        .with_columns(
+            [
+                (pl.col("q1") - 3 * pl.col("iqr")).alias("lower_bound"),
+                (pl.col("q3") + 3 * pl.col("iqr")).alias("upper_bound"),
+            ],
+        )
     )
 
     # Join thresholds back to prices
@@ -189,6 +224,201 @@ def filter_price_outliers(df_prices: pl.DataFrame) -> pl.DataFrame:
     )
 
     return df_filtered
+
+
+def fetch_coingecko_prices(
+    token_id: str,
+    start_date: str,
+    end_date: str,
+) -> pl.DataFrame:
+    """Fetch historical prices from CoinGecko API with caching.
+
+    Args:
+        token_id: CoinGecko token ID (e.g., 'weth').
+        start_date: Start date in YYYY-MM-DD format.
+        end_date: End date in YYYY-MM-DD format.
+
+    Returns:
+        Polars DataFrame with timestamps and prices in USD.
+
+    """
+    # Create cache directory if it doesn't exist
+    cache_dir = Path("data/prices")
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    # Create cache filename based on token_id and date range
+    cache_file = cache_dir / f"{token_id}_{start_date}_{end_date}.parquet"
+
+    # Check if cached file exists
+    if cache_file.exists():
+        logger.info("Loading from cache: %s", cache_file)
+        return pl.read_parquet(cache_file)
+
+    logger.info("Fetching from CoinGecko API for %s...", token_id)
+
+    # Convert dates to timestamps
+    start_ts = int(
+        datetime.strptime(start_date, "%Y-%m-%d").replace(tzinfo=UTC).timestamp(),
+    )
+    end_ts = int(
+        datetime.strptime(end_date, "%Y-%m-%d").replace(tzinfo=UTC).timestamp(),
+    )
+
+    # Use standard API endpoint with Demo API key header
+    url = f"https://api.coingecko.com/api/v3/coins/{token_id}/market_chart/range"
+    params: dict[str, str | int] = {
+        "vs_currency": "usd",
+        "from": start_ts,
+        "to": end_ts,
+    }
+    headers = {
+        "x-cg-demo-api-key": COINGECKO_API_KEY,  # Demo API key uses this header
+    }
+
+    response = requests.get(url, params=params, headers=headers, timeout=30)
+    response.raise_for_status()
+
+    data = response.json()
+    prices = data.get("prices", [])
+
+    # Convert to polars DataFrame
+    df = pl.DataFrame(
+        {
+            "timestamp": [datetime.fromtimestamp(p[0] / 1000, tz=UTC) for p in prices],
+            "price_usd": [p[1] for p in prices],
+        },
+    )
+
+    # Cache the results
+    df.write_parquet(cache_file)
+    logger.info("Cached to: %s", cache_file)
+
+    return df
+
+
+def validate_prices(
+    prices_file: Path = Path("data/usdc_prices_timeseries.parquet"),
+    start_date: str = "2025-07-01",
+    end_date: str = "2025-09-01",
+) -> None:
+    """Validate calculated USDC prices against CoinGecko data.
+
+    Compare our calculated swap-derived USDC prices against CoinGecko historical
+    data for tokens specified in validation_tokens.json.
+
+    Args:
+        prices_file: Path to calculated USDC prices parquet file.
+        start_date: Start date for CoinGecko data fetch (YYYY-MM-DD).
+        end_date: End date for CoinGecko data fetch (YYYY-MM-DD).
+
+    """
+    # Load validation tokens configuration
+    if not VALIDATION_TOKENS_FILE.exists():
+        logger.warning("Validation tokens file not found: %s", VALIDATION_TOKENS_FILE)
+        return
+
+    with VALIDATION_TOKENS_FILE.open() as f:
+        validation_config = json.load(f)
+
+    # Filter to only validation tokens
+    tokens_to_validate = {
+        addr: info for addr, info in validation_config.items() if "coingecko_id" in info
+    }
+
+    if not tokens_to_validate:
+        logger.warning(
+            "No tokens with coingecko_id found in %s",
+            VALIDATION_TOKENS_FILE,
+        )
+        return
+
+    logger.info("Validating prices for %d tokens...", len(tokens_to_validate))
+
+    # Load our calculated prices
+    if not prices_file.exists():
+        logger.warning("Prices file not found: %s", prices_file)
+        return
+
+    df_prices = pl.read_parquet(prices_file)
+
+    logger.info("Loaded %d price observations", len(df_prices))
+    logger.info("Start: %s", df_prices["block_timestamp"].min())
+    logger.info("End: %s", df_prices["block_timestamp"].max())
+    logger.info("Unique tokens: %d", df_prices["token_address"].n_unique())
+
+    # Fetch CoinGecko prices for validation tokens
+    coingecko_prices: dict[str, pl.DataFrame] = {}
+
+    for address, info in tokens_to_validate.items():
+        symbol = info.get("symbol", address[:10])
+        try:
+            df_cg = fetch_coingecko_prices(info["coingecko_id"], start_date, end_date)
+            coingecko_prices[address] = df_cg
+            logger.info("  %s: Got %d price points", symbol, len(df_cg))
+        except Exception:
+            logger.exception("Error fetching %s from CoinGecko", symbol)
+
+    # Calculate correlation and error metrics
+    logger.info("")
+    logger.info("=" * 70)
+    logger.info("VALIDATION SUMMARY")
+    logger.info("=" * 70)
+
+    for address, info in tokens_to_validate.items():
+        symbol = info.get("symbol", address[:10])
+
+        df_our = df_prices.filter(pl.col("token_address") == address)
+
+        if len(df_our) == 0:
+            logger.info("%s: No swap data available", symbol)
+            continue
+
+        if address not in coingecko_prices:
+            logger.info("%s: No CoinGecko data available", symbol)
+            continue
+
+        # Resample both to hourly and join
+        df_our_hourly = (
+            df_our.sort("block_timestamp")
+            .group_by_dynamic("block_timestamp", every="1h")
+            .agg(pl.col("price_in_usdc").mean().alias("swap_price"))
+            .with_columns(
+                pl.col("block_timestamp").dt.truncate("1h").alias("hour"),
+            )
+        )
+
+        df_cg = coingecko_prices[address]
+        df_cg_hourly = (
+            df_cg.with_columns(
+                pl.col("timestamp").dt.truncate("1h").alias("hour"),
+            )
+            .group_by("hour")
+            .agg(pl.col("price_usd").mean().alias("cg_price"))
+        )
+
+        # Join on hour
+        df_joined = df_our_hourly.join(df_cg_hourly, on="hour", how="inner")
+
+        if len(df_joined) > 0:
+            # Calculate metrics
+            correlation_result = df_joined.select(
+                pl.corr("swap_price", "cg_price").alias("corr"),
+            )["corr"][0]
+            correlation: float = float(
+                correlation_result if correlation_result is not None else 0.0,
+            )
+
+            # Mean absolute percentage error
+            mape_value = (  # type: ignore[operator]
+                (df_joined["swap_price"] - df_joined["cg_price"]).abs()
+                / df_joined["cg_price"]
+            ).mean() * 100
+            mape = float(mape_value if mape_value is not None else 0.0)  # type: ignore[arg-type]
+
+            logger.info("%s:", symbol)
+            logger.info("  Correlation: %.4f", correlation)
+            logger.info("  MAPE: %.2f%%", mape)
+            logger.info("  Matched hours: %d", len(df_joined))
 
 
 def calculate_usdc_prices(  # noqa: PLR0915
@@ -291,15 +521,17 @@ def calculate_usdc_prices(  # noqa: PLR0915
                     ]
 
                     # Add to results
-                    decoded_data.append({
-                        "block_timestamp": row["block_timestamp"],
-                        "block_number": row["block_number"],
-                        "transaction_hash": row["transaction_hash"],
-                        "pool": row["pool"],
-                        "token_address": price_result["token_address"],
-                        "price_in_usdc": price_result["price_in_usdc"],
-                        "usdc_volume": price_result["usdc_volume"],
-                    })
+                    decoded_data.append(
+                        {
+                            "block_timestamp": row["block_timestamp"],
+                            "block_number": row["block_number"],
+                            "transaction_hash": row["transaction_hash"],
+                            "pool": row["pool"],
+                            "token_address": price_result["token_address"],
+                            "price_in_usdc": price_result["price_in_usdc"],
+                            "usdc_volume": price_result["usdc_volume"],
+                        },
+                    )
                     direct_swap_count += 1
 
             # Indirect swap - use price cache to infer prices
@@ -325,15 +557,17 @@ def calculate_usdc_prices(  # noqa: PLR0915
                     usdc_volume_estimate = amount0_real * token0_usdc_price
 
                     # Add price observations for both tokens
-                    decoded_data.append({
-                        "block_timestamp": row["block_timestamp"],
-                        "block_number": row["block_number"],
-                        "transaction_hash": row["transaction_hash"],
-                        "pool": row["pool"],
-                        "token_address": token1_addr,
-                        "price_in_usdc": inferred_token1_price,
-                        "usdc_volume": usdc_volume_estimate,
-                    })
+                    decoded_data.append(
+                        {
+                            "block_timestamp": row["block_timestamp"],
+                            "block_number": row["block_number"],
+                            "transaction_hash": row["transaction_hash"],
+                            "pool": row["pool"],
+                            "token_address": token1_addr,
+                            "price_in_usdc": inferred_token1_price,
+                            "usdc_volume": usdc_volume_estimate,
+                        },
+                    )
                     indirect_swap_count += 1
             else:
                 # Can't price this swap yet - missing price data
@@ -374,35 +608,32 @@ def calculate_usdc_prices(  # noqa: PLR0915
     logger.info("Done!")
 
 
-@click.command()
-@click.option(
-    "--input-file",
-    type=click.Path(exists=True, path_type=Path),
-    default=Path("data/usdc_paired_swaps.parquet"),
-    help="Input parquet file with decoded swaps (from filter_and_decode_swaps.py)",
-)
-@click.option(
-    "--output-file",
-    type=click.Path(path_type=Path),
-    default=Path("data/usdc_prices_timeseries.parquet"),
-    help="Output parquet file for price time series",
-)
-@click.option(
-    "--filter-outliers/--no-filter-outliers",
-    default=True,
-    help="Filter extreme price outliers (default: enabled)",
-)
-@click.option(
-    "--verbose",
-    is_flag=True,
-    help="Enable verbose logging",
-)
 def main(
-    input_file: Path,
-    output_file: Path,
-    *,
-    filter_outliers: bool,
-    verbose: bool,
+    input_file: Path = typer.Option(
+        Path("data/usdc_paired_swaps.parquet"),
+        "--input-file",
+        help="Input parquet file with decoded swaps (from filter_and_decode_swaps.py)",
+    ),
+    output_file: Path = typer.Option(
+        Path("data/usdc_prices_timeseries.parquet"),
+        "--output-file",
+        help="Output parquet file for price time series",
+    ),
+    filter_outliers: bool = typer.Option(
+        True,
+        "--filter-outliers/--no-filter-outliers",
+        help="Filter extreme price outliers (default: enabled)",
+    ),
+    validate: bool = typer.Option(
+        False,
+        "--validate",
+        help="Validate prices against CoinGecko data after calculation",
+    ),
+    verbose: bool = typer.Option(
+        False,
+        "--verbose",
+        help="Enable verbose logging",
+    ),
 ) -> None:
     """Calculate USDC prices from decoded swap data."""
     logging.basicConfig(
@@ -416,6 +647,13 @@ def main(
         filter_outliers=filter_outliers,
     )
 
+    # Run validation if requested
+    if validate:
+        logger.info("Running price validation...")
+        validate_prices(output_file)
+
 
 if __name__ == "__main__":
-    main()
+    app = typer.Typer()
+    app.command()(main)
+    app()

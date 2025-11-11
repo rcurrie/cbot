@@ -411,11 +411,6 @@ def main(
     ),
 ) -> None:
     """Filter and decode USDC-paired swaps from raw swap data."""
-    # logging.basicConfig(
-    #     level=logging.INFO if verbose else logging.WARNING,
-    #     format="%(asctime)s - %(levelname)s - %(message)s",
-    # )
-
     logging.basicConfig(
         level=logging.INFO if verbose else logging.WARNING,
         format="%(asctime)s %(levelname)s %(message)s",
