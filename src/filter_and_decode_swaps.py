@@ -14,9 +14,11 @@ import logging
 from pathlib import Path
 from typing import Any
 
-import click
 import polars as pl
+import typer
 from web3 import Web3
+
+app = typer.Typer()
 
 logger = logging.getLogger(__name__)
 
@@ -115,7 +117,7 @@ def decode_tick(data_hex: str) -> int:
 
     # Extract tick (last 3 bytes of the fifth 32-byte chunk)
     # The tick is int24, stored in the last 3 bytes
-    tick_hex = data[256 + 58:256 + 64]  # Last 3 bytes (6 hex chars)
+    tick_hex = data[256 + 58 : 256 + 64]  # Last 3 bytes (6 hex chars)
 
     # Decode as signed 24-bit integer
     tick_unsigned = int.from_bytes(bytes.fromhex(tick_hex), "big", signed=False)
@@ -290,47 +292,65 @@ def filter_and_decode_usdc_swaps(
     logger.info("Decoding swap events...")
 
     # Extract sender, recipient, and keep pool address in normalized form
-    df_decoded = df_filtered.with_columns([
-        # Extract sender and recipient from topics (skip 0x and padding)
-        pl.col("topics").list.get(1).str.slice(26).str.to_lowercase().alias("sender"),
-        pl.col("topics").list.get(2).str.slice(26).str.to_lowercase().alias("recipient"),
-        # Keep pool address in normalized form
-        pl.col("pool_or_manager_address").str.to_lowercase().alias("pool"),
-    ])
+    df_decoded = df_filtered.with_columns(
+        [
+            # Extract sender and recipient from topics (skip 0x and padding)
+            pl.col("topics")
+            .list.get(1)
+            .str.slice(26)
+            .str.to_lowercase()
+            .alias("sender"),
+            pl.col("topics")
+            .list.get(2)
+            .str.slice(26)
+            .str.to_lowercase()
+            .alias("recipient"),
+            # Keep pool address in normalized form
+            pl.col("pool_or_manager_address").str.to_lowercase().alias("pool"),
+        ],
+    )
 
     # Add token decimals without decoding swap data
     logger.info("Adding token decimals...")
-    df_final = df_decoded.with_columns([
-        pl.col("token0").map_elements(
-            lambda t: decimals_map.get(t, 18),
-            return_dtype=pl.Int32,
-        ).alias("token0_decimals"),
-        pl.col("token1").map_elements(
-            lambda t: decimals_map.get(t, 18),
-            return_dtype=pl.Int32,
-        ).alias("token1_decimals"),
-    ])
+    df_final = df_decoded.with_columns(
+        [
+            pl.col("token0")
+            .map_elements(
+                lambda t: decimals_map.get(t, 18),
+                return_dtype=pl.Int32,
+            )
+            .alias("token0_decimals"),
+            pl.col("token1")
+            .map_elements(
+                lambda t: decimals_map.get(t, 18),
+                return_dtype=pl.Int32,
+            )
+            .alias("token1_decimals"),
+        ],
+    )
 
     # Select final columns, keeping raw 'data' field for on-demand decoding
-    df_final = df_final.select([
-        "block_timestamp",
-        "block_number",
-        "transaction_hash",
-        "pool",
-        "token0",
-        "token1",
-        "token0_decimals",
-        "token1_decimals",
-        "sender",
-        "recipient",
-        "data",  # Keep raw hex data for decoding on-demand
-    ])
+    df_final = df_final.select(
+        [
+            "block_timestamp",
+            "block_number",
+            "transaction_hash",
+            "pool",
+            "token0",
+            "token1",
+            "token0_decimals",
+            "token1_decimals",
+            "sender",
+            "recipient",
+            "data",  # Keep raw hex data for decoding on-demand
+        ],
+    )
 
     # Sort by timestamp
     df_final = df_final.sort("block_timestamp")
 
     # Analyze USDC coverage
-    logger.info("\nUSDC Coverage Analysis:")
+    logger.info("USDC Coverage Analysis:")
     swaps_with_usdc = df_final.filter(
         (pl.col("token0") == USDC_ADDRESS.lower())
         | (pl.col("token1") == USDC_ADDRESS.lower()),
@@ -357,7 +377,7 @@ def filter_and_decode_usdc_swaps(
     logger.info("  USDC as token0: %s", f"{usdc_as_token0:,}")
     logger.info("  USDC as token1: %s", f"{usdc_as_token1:,}")
 
-    logger.info("\nSaving to %s...", output_file)
+    logger.info("Saving to %s...", output_file)
     output_file.parent.mkdir(parents=True, exist_ok=True)
     df_final.write_parquet(output_file)
 
@@ -367,45 +387,48 @@ def filter_and_decode_usdc_swaps(
     )
 
 
-@click.command()
-@click.option(
-    "--input-dir",
-    type=click.Path(exists=True, path_type=Path),
-    default=Path("data/swaps"),
-    help="Directory containing input parquet files",
-)
-@click.option(
-    "--output-file",
-    type=click.Path(path_type=Path),
-    default=Path("data/usdc_paired_swaps.parquet"),
-    help="Output parquet file path",
-)
-@click.option(
-    "--pools-file",
-    type=click.Path(exists=True, path_type=Path),
-    default=Path("data/pools.json"),
-    help="JSON file with pool information",
-)
-@click.option(
-    "--verbose",
-    is_flag=True,
-    help="Enable verbose logging",
-)
+@app.command()
 def main(
-    input_dir: Path,
-    output_file: Path,
-    pools_file: Path,
-    *,
-    verbose: bool,
+    input_dir: Path = typer.Option(
+        "data/swaps",
+        "--input-dir",
+        help="Directory containing input parquet files",
+    ),
+    output_file: Path = typer.Option(
+        "data/usdc_paired_swaps.parquet",
+        "--output-file",
+        help="Output parquet file path",
+    ),
+    pools_file: Path = typer.Option(
+        "data/pools.json",
+        "--pools-file",
+        help="JSON file with pool information",
+    ),
+    verbose: bool = typer.Option(
+        False,
+        "--verbose",
+        help="Enable verbose logging",
+    ),
 ) -> None:
     """Filter and decode USDC-paired swaps from raw swap data."""
+    # logging.basicConfig(
+    #     level=logging.INFO if verbose else logging.WARNING,
+    #     format="%(asctime)s - %(levelname)s - %(message)s",
+    # )
+
     logging.basicConfig(
         level=logging.INFO if verbose else logging.WARNING,
-        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+        format="%(asctime)s %(levelname)s %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
     )
 
-    filter_and_decode_usdc_swaps(input_dir, output_file, pools_file)
+    # Convert string paths to Path objects
+    input_path = Path(input_dir)
+    output_path = Path(output_file)
+    pools_path = Path(pools_file)
+
+    filter_and_decode_usdc_swaps(input_path, output_path, pools_path)
 
 
 if __name__ == "__main__":
-    main()
+    app()
