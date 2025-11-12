@@ -21,17 +21,21 @@ filter-and-decode-swaps:
 calculate-usdc-prices:
 	python src/calculate_usdc_prices.py --verbose --validate
 
-generate-volume-bars:
-	python src/generate_pool_bars.py --verbose --validate
+generate-usdc-bars:
+	python src/generate_usdc_bars.py --verbose --validate
 
 make-stationary:
 	python src/make_stationary.py --verbose --validate
 
-
-
-# Phase 3: From stationary prices to labeled data using Triple-Barrier Method
 label-triple-barrier:
-	python src/label_triple_barrier.py --verbose
+	python src/label_triple_barrier.py --verbose --validate
+
+
+
+
+update-train-test-data: filter-and-decode-swaps calculate-usdc-prices generate-usdc-bars make-stationary label-triple-barrier
+
+
 
 
 

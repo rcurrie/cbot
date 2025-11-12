@@ -1,11 +1,11 @@
-"""Generate pool-level bars with signed net flows from USDC-paired swaps.
+"""Generate pool-level usdc bars with signed net flows from USDC-paired swaps.
 
 This script implements Milestone 1 of Phase 2:
 - Groups swaps by pool_id
 - Accumulates swaps into dollar bars based on target_usdc_bar_size
 - Calculates signed net flows for each token in the bar
 - Generates two output rows per bar (one per token)
-- Outputs master_message_log.parquet with bar statistics and signed flows
+- Outputs usdc_bars.parquet with bar statistics and signed flows
 """
 
 import json
@@ -106,7 +106,7 @@ def generate_pool_bars(  # noqa: C901, PLR0912, PLR0915
         swaps_file: Path to usdc_paired_swaps.parquet (needed for flow direction).
         prices_file: Path to usdc_prices_timeseries.parquet.
         pools_file: Path to pools.json.
-        output_file: Path to output master_message_log.parquet.
+        output_file: Path to output usdc_bars.parquet.
         target_usdc_bar_size: Target dollar volume per bar (e.g., 100000 for $100k).
 
     """
@@ -325,7 +325,7 @@ def generate_pool_bars(  # noqa: C901, PLR0912, PLR0915
     output_df.write_parquet(output_file)
 
     logger.info(
-        "Done! Saved %s messages to master_message_log.parquet",
+        "Done! Saved %s messages to usdc_bars.parquet",
         f"{len(output_df):,}",
     )
 
@@ -481,7 +481,7 @@ def fetch_coingecko_prices(
     start_date: str,
     end_date: str,
 ) -> pl.DataFrame:
-    """Fetch historical prices from CoinGecko API.
+    """Fetch historical prices from CoinGecko API with caching.
 
     Args:
         token_id: CoinGecko token ID (e.g., 'usd-coin').
@@ -492,6 +492,20 @@ def fetch_coingecko_prices(
         DataFrame with timestamp and price_usd columns.
 
     """
+    # Create cache directory if it doesn't exist
+    cache_dir = Path("data/prices")
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    # Create cache filename based on token_id and date range
+    cache_file = cache_dir / f"{token_id}_{start_date}_{end_date}.parquet"
+
+    # Check if cached file exists
+    if cache_file.exists():
+        logger.info("Loading from cache: %s", cache_file)
+        return pl.read_parquet(cache_file)
+
+    logger.info("Fetching from CoinGecko API for %s...", token_id)
+
     # Convert dates to timestamps
     start_ts = int(
         datetime.strptime(start_date, "%Y-%m-%d").replace(tzinfo=UTC).timestamp(),
@@ -517,12 +531,18 @@ def fetch_coingecko_prices(
     prices = data.get("prices", [])
 
     # Convert to polars DataFrame
-    return pl.DataFrame(
+    df = pl.DataFrame(
         {
             "timestamp": [datetime.fromtimestamp(p[0] / 1000, tz=UTC) for p in prices],
             "price_usd": [p[1] for p in prices],
         },
     )
+
+    # Cache the results
+    df.write_parquet(cache_file)
+    logger.info("Cached to: %s", cache_file)
+
+    return df
 
 
 def _validate_against_coingecko(
@@ -649,7 +669,7 @@ def validate_volume_bars(output_file: Path) -> None:
     data for tokens specified in validation_tokens.json.
 
     Args:
-        output_file: Path to the generated master_message_log.parquet file.
+        output_file: Path to the generated usdc_bars.parquet file.
 
     """
     logger.info("Validating volume bars...")
@@ -731,7 +751,7 @@ def main(
         help="JSON file with pool information",
     ),
     output_file: Path = typer.Option(
-        Path("data/master_message_log.parquet"),
+        Path("data/usdc_bars.parquet"),
         "--output-file",
         help="Output parquet file path",
     ),

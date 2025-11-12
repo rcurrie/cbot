@@ -4,7 +4,7 @@ Machine Learning driven Crypto Trading System using Decentralized Exchange (DEX)
 
 # Important
 
-RULE NUMBER 1 (NEVER EVER EVER FORGET THIS RULE!!!): YOU ARE NEVER ALLOWED TO DELETE A FILE WITHOUT EXPRESS PERMISSION FROM ME OR A DIRECT COMMAND FROM ME. EVEN A NEW FILE THAT YOU YOURSELF CREATED, SUCH AS A TEST CODE FILE. YOU HAVE A HORRIBLE TRACK RECORD OF DELETING CRITICALLY IMPORTANT FILES OR OTHERWISE THROWING AWAY TONS OF EXPENSIVE WORK THAT I THEN NEED TO PAY TO REPRODUCE. AS A RESULT, YOU HAVE PERMANENTLY LOST ANY AND ALL RIGHTS TO DETERMINE THAT A FILE OR FOLDER SHOULD BE DELETED. YOU MUST **ALWAYS** ASK AND _RECEIVE_ CLEAR, WRITTEN PERMISSION FROM ME BEFORE EVER EVEN THINKING OF DELETING A FILE OR FOLDER OF ANY KIND!!!
+NEVER DELETE A FILE WITHOUT EXPRESS PERMISSION FROM ME OR A DIRECT COMMAND FROM ME.
 
 # Coding Philosophy
 
@@ -32,7 +32,7 @@ RULE NUMBER 1 (NEVER EVER EVER FORGET THIS RULE!!!): YOU ARE NEVER ALLOWED TO DE
 # Type Safety & Linting
 
 - Ruff for linting and strict except for exclusions configured in pyproject.toml
-- To check for linter errors/warnings and fix: `ruff check --fix --unsafe-fixes`
+- To check for linter errors/warnings and fix: `uv ruff check --fix --unsafe-fixes`
 - Strict Mypy typing for all functions, variables, and definitions
 - Use Pydantic for data validation
 
@@ -40,6 +40,7 @@ RULE NUMBER 1 (NEVER EVER EVER FORGET THIS RULE!!!): YOU ARE NEVER ALLOWED TO DE
 
 - Use `pathlib` over `os.path`
 - Per-file logger instead of print (no f-strings in logging)
+- Use logging format="%(asctime)s %(levelname)s %(message)s" and datefmt="%Y-%m-%d %H:%M:%S"
 - Imperative style docstrings
 - `logging.exception` in exception handlers, not `logging.error`
 - Assertions are encouraged for cleaner data wrangling code
@@ -48,49 +49,36 @@ RULE NUMBER 1 (NEVER EVER EVER FORGET THIS RULE!!!): YOU ARE NEVER ALLOWED TO DE
 - Polars for data processing (not pandas)
 - Load secrets from `.env` via dotenv
 
-# Development Workflow
-
-1. **Before coding:** Read context, identify insertion points, assess what could break
-2. **Run linting:** `ruff check --fix .`
-3. **Run type checking:**o `mypy .`
-
 ### ast-grep vs ripgrep (quick guidance)
 
 **Use `ast-grep` when structure matters.** It parses code and matches AST nodes, so results ignore comments/strings, understand syntax, and can **safely rewrite** code.
 
-- Refactors/codemods: rename APIs, change import forms, rewrite call sites or variable kinds.
-- Policy checks: enforce patterns across a repo (`scan` with rules + `test`).
-- Editor/automation: LSP mode; `--json` output for tooling.
-
 **Use `ripgrep` when text is enough.** It’s the fastest way to grep literals/regex across files.
-
-- Recon: find strings, TODOs, log lines, config values, or non‑code assets.
-- Pre-filter: narrow candidate files before a precise pass.
 
 **Snippets**
 
 Find structured code (ignores comments/strings):
 
 ```bash
-ast-grep run -l TypeScript -p 'import $X from "$P"'
+uv ast-grep run -l TypeScript -p 'import $X from "$P"'
 ```
 
 Codemod (only real `var` declarations become `let`):
 
 ```bash
-ast-grep run -l JavaScript -p 'var $A = $B' -r 'let $A = $B' -U
+uv ast-grep run -l JavaScript -p 'var $A = $B' -r 'let $A = $B' -U
 ```
 
 Quick textual hunt:
 
 ```bash
-rg -n 'console\.log\(' -t js
+uv rg -n 'console\.log\(' -t js
 ```
 
 Combine speed + precision:
 
 ```bash
-rg -l -t ts 'useQuery\(' | xargs ast-grep run -l TypeScript -p 'useQuery($A)' -r 'useSuspenseQuery($A)' -U
+uv rg -l -t ts 'useQuery\(' | xargs ast-grep run -l TypeScript -p 'useQuery($A)' -r 'useSuspenseQuery($A)' -U
 ```
 
 **Mental model**

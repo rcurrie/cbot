@@ -1,7 +1,7 @@
 """Make target variable stationary using fractional differentiation.
 
 This script implements Milestone 2 of Phase 2:
-- Load master_message_log.parquet
+- Load usdc_bars.parquet
 - Group by token_id
 - Apply log transformation to token_close_price_usdc
 - Find minimum fractional differentiation order d for each token
@@ -210,7 +210,7 @@ def make_stationary(
     """Make target variable stationary using fractional differentiation.
 
     Args:
-        input_file: Path to master_message_log.parquet.
+        input_file: Path to usdc_bars.parquet.
         output_file: Path to output log_fracdiff_price.parquet.
         d_min: Minimum fractional differentiation order to search.
         d_max: Maximum fractional differentiation order to search.
@@ -434,8 +434,8 @@ def validate_output(
 
 def main(
     input_file: Path = typer.Option(
-        Path("data/master_message_log.parquet"),
-        help="Input master_message_log.parquet file",
+        Path("data/usdc_bars.parquet"),
+        help="Input usdc_bars.parquet file",
     ),
     output_file: Path = typer.Option(
         Path("data/log_fracdiff_price.parquet"),
