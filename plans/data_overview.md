@@ -45,8 +45,8 @@ The primary event-based dataset. Rows represent a completed volume bar for a spe
 
 Stationary features ready for model input.
 
-- **Key Columns**: `y_target_fracdiff` (Fractionally differentiated log price).
-- **Method**: Finds minimum order $d$ (0.0-1.0) per token to pass ADF test ($p < 0.05$).
+- **Key Columns**: `src_fracdiff`, `dest_fracdiff` (Fractionally differentiated log prices).
+- **Method**: Finds minimum order $d$ (0.0-1.0) per token to pass ADF test ($p < 0.05$). Joins fracdiff series back to bars for both source and destination tokens.
 
 ### 5. `labeled_log_fracdiff_price.parquet` (Training Data)
 
@@ -57,16 +57,18 @@ Final dataset for Supervised Learning.
   - `sample_weight`: Weight adjustment for overlapping labels (uniqueness).
   - `rolling_volatility`: Volatility used for dynamic barrier sizing.
   - `barrier_touch_bars`: Number of bars until the barrier was touched.
-- **Method**: Triple-Barrier Method (Marcos López de Prado).
+- **Method**: Triple-Barrier Method (Marcos López de Prado) applied to `src_fracdiff`.
   - **Upper Barrier**: Current Price + $C_1 \times \sigma$
   - **Lower Barrier**: Current Price - $C_2 \times \sigma$
-  - **Vertical Barrier**: Fixed time horizon ($N$ bars).
+  - **Vertical Barrier**: Dynamic Volume-Clock horizon (10% of daily volume).
 
 ## Methodological Notes
 
 - **Dollar Bars**: We sample based on financial activity (volume) rather than time. This recovers normality in data distributions and synchronizes active/inactive periods.
 - **Fractional Differentiation**: Standard differencing ($d=1$) destroys memory. We use the minimum $d$ necessary to achieve stationarity, preserving the maximum amount of history/trend information.
-- **Triple Barrier Method**: A dynamic labeling technique that accounts for volatility. It avoids the pitfalls of fixed-horizon labeling (e.g., ignoring stop-outs that happened before the horizon).
+- **Double Lookup**: We calculate stationary series for all tokens globally and then join them back to the bars twice (for source and destination) to ensure the model has visibility into the state of both assets in the swap.
+- **Triple Barrier Method**: A dynamic labeling technique that accounts for volatility. It avoids the pitfalls of fixed-horizon labeling.
+  - **Volatility-Adjusted Time Horizons**: Instead of a fixed time barrier (e.g., 8 hours), we use a "Volume-Clock" approach. The vertical barrier is set to 10% of the token's Average Daily Volume (measured in bars). This ensures we hold liquid tokens for shorter periods (e.g., 30-60 mins) and illiquid tokens for longer periods (e.g., 4-8 hours), aligning with the market's information processing speed.
 
 ## Next Steps: TGNN Development
 
@@ -74,5 +76,5 @@ The `labeled_log_fracdiff_price.parquet` file is the direct input for the Tempor
 
 - **Nodes**: Tokens.
 - **Edges**: Pools (weighted by flow/volume).
-- **Node Features**: `y_target_fracdiff`, `rolling_volatility`, `src_flow_usdc`.
+- **Node Features**: `src_fracdiff`, `dest_fracdiff`, `rolling_volatility`, `src_flow_usdc`.
 - **Edge Features**: `bar_time_delta_sec`, `tick_count`.

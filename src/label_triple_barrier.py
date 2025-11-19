@@ -26,7 +26,7 @@ def calculate_rolling_volatility(
     """Calculate rolling standard deviation.
 
     Args:
-        series: Time series data (y_target_fracdiff).
+        series: Time series data (src_fracdiff).
         window: Rolling window size.
 
     Returns:
@@ -42,6 +42,44 @@ def calculate_rolling_volatility(
     return volatility
 
 
+def calculate_dynamic_vertical_barrier(
+    timestamps: pl.Series,
+    barrier_fraction: float = 0.1,
+    min_bars: int = 1,
+    max_bars: int = 1000,
+) -> int:
+    """Calculate dynamic vertical barrier based on average daily volume (bars).
+
+    Args:
+        timestamps: Series of bar timestamps.
+        barrier_fraction: Fraction of daily volume to use as barrier.
+        min_bars: Minimum number of bars for the barrier.
+        max_bars: Maximum number of bars for the barrier.
+
+    Returns:
+        Number of bars to use as vertical barrier.
+
+    """
+    if len(timestamps) < 2:
+        return min_bars
+
+    # Calculate total duration in days
+    duration = timestamps.max() - timestamps.min()
+    duration_days = duration.total_seconds() / 86400.0
+
+    if duration_days <= 0:
+        return min_bars
+
+    # Average bars per day
+    avg_daily_bars = len(timestamps) / duration_days
+
+    # Calculate barrier
+    barrier = int(avg_daily_bars * barrier_fraction)
+
+    # Clamp
+    return max(min_bars, min(barrier, max_bars))
+
+
 def apply_triple_barrier(
     prices: np.ndarray,
     volatilities: np.ndarray,
@@ -52,7 +90,7 @@ def apply_triple_barrier(
     """Apply triple-barrier method to generate labels.
 
     Args:
-        prices: Price series (y_target_fracdiff).
+        prices: Price series (src_fracdiff).
         volatilities: Rolling volatility series.
         upper_multiple: Multiplier for upper barrier (C1).
         lower_multiple: Multiplier for lower barrier (C2).
@@ -254,7 +292,7 @@ def label_triple_barrier(
     output_file: Path,
     upper_multiple: float,
     lower_multiple: float,
-    vertical_bars: int,
+    barrier_fraction: float,
     volatility_window: int,
     verbose: bool = False,
 ) -> None:
@@ -265,7 +303,7 @@ def label_triple_barrier(
         output_file: Path to output labeled_log_fracdiff_price.parquet.
         upper_multiple: Multiplier for upper barrier (take profit).
         lower_multiple: Multiplier for lower barrier (stop loss).
-        vertical_bars: Number of bars for time limit.
+        barrier_fraction: Fraction of daily volume for vertical barrier.
         volatility_window: Rolling window for volatility calculation.
         verbose: Whether to log detailed statistics.
 
@@ -281,7 +319,7 @@ def label_triple_barrier(
     logger.info("\nTriple-Barrier Parameters:")
     logger.info("  Upper barrier multiplier (C1): %.2f", upper_multiple)
     logger.info("  Lower barrier multiplier (C2): %.2f", lower_multiple)
-    logger.info("  Vertical bars (N): %d", vertical_bars)
+    logger.info("  Barrier fraction (daily vol): %.2f", barrier_fraction)
     logger.info("  Volatility window: %d", volatility_window)
 
     # Sort by src_token_id and timestamp
@@ -296,15 +334,22 @@ def label_triple_barrier(
         token_id = token_tuple[0]
         token_df = token_group.sort("bar_close_timestamp")
 
+        # Calculate dynamic vertical barrier
+        vertical_bars = calculate_dynamic_vertical_barrier(
+            token_df["bar_close_timestamp"],
+            barrier_fraction=barrier_fraction,
+        )
+
         # Get price series (stationary target)
-        prices = token_df["y_target_fracdiff"].to_numpy()
+        prices = token_df["src_fracdiff"].to_numpy()
 
         # Check for invalid data
         if len(prices) < volatility_window + vertical_bars:
             logger.warning(
-                "Token %s has insufficient data (%d bars), skipping",
+                "Token %s has insufficient data (%d bars) for barrier %d, skipping",
                 token_id[:10] + "...",
                 len(prices),
+                vertical_bars,
             )
             continue
 
@@ -422,7 +467,8 @@ def validate_output(output_file: Path, verbose: bool = False) -> None:
         "src_token_id",
         "pool_id",
         "bar_close_timestamp",
-        "y_target_fracdiff",
+        "src_fracdiff",
+        "dest_fracdiff",
         "label",
         "sample_weight",
         "rolling_volatility",
@@ -474,9 +520,9 @@ def main(
         1.0,
         help="Multiplier for lower barrier (stop loss, C2)",
     ),
-    vertical_bars: int = typer.Option(
-        25,
-        help="Number of bars for time limit (N)",
+    barrier_fraction: float = typer.Option(
+        0.1,
+        help="Fraction of daily volume for vertical barrier (default 0.1 = 10%)",
     ),
     volatility_window: int = typer.Option(
         20,
@@ -503,7 +549,7 @@ def main(
         output_file,
         upper_multiple,
         lower_multiple,
-        vertical_bars,
+        barrier_fraction,
         volatility_window,
         verbose=verbose,
     )

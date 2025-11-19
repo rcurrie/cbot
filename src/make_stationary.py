@@ -120,11 +120,11 @@ def _process_token_group(
     d_max: float,
     d_step: float,
 ) -> tuple[pl.DataFrame | None, dict[str, object]]:
-    """Process a single source token group for stationarity.
+    """Process a single token group for stationarity.
 
     Args:
-        token_id: Source token identifier.
-        token_df: DataFrame for this source token (rows sorted by timestamp).
+        token_id: Token identifier.
+        token_df: DataFrame for this token (rows sorted by timestamp).
         d_min: Minimum d to search.
         d_max: Maximum d to search.
         d_step: Step size for d search.
@@ -134,8 +134,8 @@ def _process_token_group(
         should be skipped (non-stationary or invalid data).
 
     """
-    # Get source price series
-    prices = token_df["src_price_usdc"].to_numpy()
+    # Get price series
+    prices = token_df["price"].to_numpy()
 
     # Apply log transformation
     log_prices = np.log(prices)
@@ -192,7 +192,7 @@ def _process_token_group(
 
     # Add fracdiff values to token_df
     result_df = token_df.with_columns(
-        [pl.Series("y_target_fracdiff", fracdiff_log_price)],
+        [pl.Series("fracdiff", fracdiff_log_price)],
     )
 
     return result_df, stats
@@ -226,8 +226,37 @@ def make_stationary(
         df["src_token_id"].n_unique(),
     )
 
-    # Sort by src_token_id and timestamp for proper time series processing
-    df = df.sort(["src_token_id", "bar_close_timestamp"])
+    # Extract unique price observations for all tokens (both src and dest)
+    logger.info("Extracting price series for all tokens...")
+
+    # Get prices from source side
+    df_src = df.select(
+        pl.col("src_token_id").alias("token_id"),
+        pl.col("bar_close_timestamp"),
+        pl.col("src_price_usdc").alias("price"),
+    )
+
+    # Get prices from dest side
+    df_dest = df.select(
+        pl.col("dest_token_id").alias("token_id"),
+        pl.col("bar_close_timestamp"),
+        pl.col("dest_price_usdc").alias("price"),
+    )
+
+    # Combine and deduplicate (taking mean price if multiple pools have bars at same
+    # timestamp)
+    df_prices = (
+        pl.concat([df_src, df_dest])
+        .group_by(["token_id", "bar_close_timestamp"])
+        .agg(pl.col("price").mean())
+        .sort(["token_id", "bar_close_timestamp"])
+    )
+
+    logger.info(
+        "Extracted %s unique price observations for %d tokens",
+        f"{len(df_prices):,}",
+        df_prices["token_id"].n_unique(),
+    )
 
     logger.info("\nProcessing tokens to achieve stationarity...")
     logger.info(
@@ -237,11 +266,11 @@ def make_stationary(
         d_step,
     )
 
-    # Process each source token group
+    # Process each token group
     all_fracdiff_rows: list[pl.DataFrame] = []
     token_stats: list[dict[str, object]] = []
 
-    for token_tuple, token_group in df.group_by("src_token_id", maintain_order=True):
+    for token_tuple, token_group in df_prices.group_by("token_id", maintain_order=True):
         token_id = token_tuple[0]  # Extract scalar from tuple
         token_df = token_group.sort("bar_close_timestamp")
 
@@ -261,21 +290,50 @@ def make_stationary(
             assert result_df is not None
             all_fracdiff_rows.append(result_df)
 
-    # Combine all token dataframes
+    # Combine all token fracdiff series
     logger.info("\nCombining results from all tokens...")
-    result_df = pl.concat(all_fracdiff_rows)
+    df_fracdiff = pl.concat(all_fracdiff_rows)
 
-    # Drop rows with NaN in y_target_fracdiff
+    # Join fracdiff values back to original bars (Double Lookup)
+    logger.info("Joining fracdiff values back to bars (Double Lookup)...")
+
+    # 1. Join for Source Token
+    result_df = df.join(
+        df_fracdiff.select(["token_id", "bar_close_timestamp", "fracdiff"]),
+        left_on=["src_token_id", "bar_close_timestamp"],
+        right_on=["token_id", "bar_close_timestamp"],
+        how="left",
+    ).rename({"fracdiff": "src_fracdiff"})
+
+    # 2. Join for Destination Token
+    result_df = result_df.join(
+        df_fracdiff.select(["token_id", "bar_close_timestamp", "fracdiff"]),
+        left_on=["dest_token_id", "bar_close_timestamp"],
+        right_on=["token_id", "bar_close_timestamp"],
+        how="left",
+    ).rename({"fracdiff": "dest_fracdiff"})
+
+    # Drop rows with NaN in src_fracdiff (we need at least the source to be valid)
+    # Note: dest_fracdiff might be NaN if dest token was dropped due to non-stationarity
     n_before = len(result_df)
-    result_df = result_df.filter(pl.col("y_target_fracdiff").is_not_nan())
+    result_df = result_df.filter(pl.col("src_fracdiff").is_not_nan())
     n_after = len(result_df)
     n_dropped = n_before - n_after
 
     logger.info(
-        "Dropped %s bar events with NaN fracdiff values (%.1f%%)",
+        "Dropped %s bar events with NaN src_fracdiff values (%.1f%%)",
         f"{n_dropped:,}",
         100 * n_dropped / n_before if n_before > 0 else 0,
     )
+
+    # Check dest_fracdiff coverage
+    n_dest_nan = result_df.filter(pl.col("dest_fracdiff").is_null()).height
+    if n_dest_nan > 0:
+        logger.warning(
+            "  %s bars have NaN dest_fracdiff (%.1f%%)",
+            f"{n_dest_nan:,}",
+            100 * n_dest_nan / len(result_df),
+        )
 
     # Log statistics
     _log_stationarity_stats(token_stats, drop_non_stationary)
@@ -376,7 +434,8 @@ def validate_output(
         "pool_id",
         "bar_close_timestamp",
         "src_price_usdc",
-        "y_target_fracdiff",
+        "src_fracdiff",
+        "dest_fracdiff",
     }
     missing_cols = required_cols - set(df.columns)
     if missing_cols:
@@ -386,29 +445,29 @@ def validate_output(
 
     # Check data types
     logger.info("  Column data types:")
-    for col in ["y_target_fracdiff", "src_price_usdc"]:
+    for col in ["src_fracdiff", "dest_fracdiff", "src_price_usdc"]:
         dtype = df.select(col).dtypes[0]
         logger.info("    %s: %s", col, dtype)
 
     # Check for NaNs in critical columns
     nan_counts: dict[str, int] = {}
-    for col_name in ["src_token_id", "pool_id", "y_target_fracdiff"]:
+    for col_name in ["src_token_id", "pool_id", "src_fracdiff"]:
         nan_count = df.filter(pl.col(col_name).is_null()).height
         nan_counts[col_name] = nan_count
         if nan_count > 0:
             logger.warning("    %s has %d NaN values", col_name, nan_count)
     logger.info("  ✓ NaN check complete: %s", nan_counts)
 
-    # Check y_target_fracdiff statistics
+    # Check src_fracdiff statistics
     fracdiff_stats = df.select(
         [
-            pl.col("y_target_fracdiff").min().alias("min"),
-            pl.col("y_target_fracdiff").max().alias("max"),
-            pl.col("y_target_fracdiff").mean().alias("mean"),
-            pl.col("y_target_fracdiff").std().alias("std"),
+            pl.col("src_fracdiff").min().alias("min"),
+            pl.col("src_fracdiff").max().alias("max"),
+            pl.col("src_fracdiff").mean().alias("mean"),
+            pl.col("src_fracdiff").std().alias("std"),
         ],
     )
-    logger.info("  y_target_fracdiff statistics:")
+    logger.info("  src_fracdiff statistics:")
     for row in fracdiff_stats.iter_rows(named=True):
         logger.info(
             "    min=%.4f, max=%.4f, mean=%.6f, std=%.6f",
