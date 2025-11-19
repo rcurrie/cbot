@@ -4,7 +4,8 @@ This script implements Milestone 1 of Phase 2:
 - Groups swaps by pool_id
 - Accumulates swaps into dollar bars based on target_usdc_bar_size
 - Calculates signed net flows for each token in the bar
-- Generates two output rows per bar (one per token)
+- Determines primary flow direction (src -> dest) based on dominant flow
+- Generates one output row per bar with src and dest token information
 - Outputs usdc_bars.parquet with bar statistics and signed flows
 """
 
@@ -25,6 +26,9 @@ logger = logging.getLogger(__name__)
 load_dotenv()
 COINGECKO_API_KEY = os.getenv("COINGECKO_API_KEY")
 VALIDATION_TOKENS_FILE = Path("validation_tokens.json")
+
+# USDC address (used as numeraire, always $1.00)
+USDC_ADDRESS = "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"
 
 # Create Typer app for CLI
 app = typer.Typer(help="Generate pool-level bars with signed net flows.")
@@ -255,8 +259,10 @@ def generate_pool_bars(  # noqa: C901, PLR0912, PLR0915
                 )
 
                 # Get final prices (last price for each token in the bar)
-                token_a_price = None
-                token_b_price = None
+                # USDC is always $1.00 (it's the numeraire)
+                token_a_price = 1.0 if token_a == USDC_ADDRESS else None
+                token_b_price = 1.0 if token_b == USDC_ADDRESS else None
+
                 for rec in reversed(bar_price_records):
                     if rec["token_address"] == token_a and token_a_price is None:
                         token_a_price = rec["price_in_usdc"]
@@ -265,28 +271,35 @@ def generate_pool_bars(  # noqa: C901, PLR0912, PLR0915
                     if token_a_price is not None and token_b_price is not None:
                         break
 
-                # Generate rows for both tokens (if we have prices for both)
-                if token_a_price is not None:
-                    all_bar_rows.append(
-                        {
-                            "bar_close_timestamp": bar_close_timestamp,
-                            "pool_id": pool_id,
-                            "token_id": token_a,
-                            "net_flow_usdc": net_flow_a,
-                            "token_close_price_usdc": token_a_price,
-                            "bar_time_delta_sec": bar_time_delta_sec,
-                            "tick_count": tick_count,
-                        },
-                    )
+                # Determine flow direction (src -> dest) based on dominant flow
+                # The token with larger absolute flow is the source
+                if abs(net_flow_a) > abs(net_flow_b):
+                    src_token = token_a
+                    dest_token = token_b
+                    src_flow = net_flow_a
+                    dest_flow = net_flow_b
+                    src_price = token_a_price
+                    dest_price = token_b_price
+                else:
+                    src_token = token_b
+                    dest_token = token_a
+                    src_flow = net_flow_b
+                    dest_flow = net_flow_a
+                    src_price = token_b_price
+                    dest_price = token_a_price
 
-                if token_b_price is not None:
+                # Generate single row for this bar (only if we have both prices)
+                if src_price is not None and dest_price is not None:
                     all_bar_rows.append(
                         {
                             "bar_close_timestamp": bar_close_timestamp,
                             "pool_id": pool_id,
-                            "token_id": token_b,
-                            "net_flow_usdc": net_flow_b,
-                            "token_close_price_usdc": token_b_price,
+                            "src_token_id": src_token,
+                            "dest_token_id": dest_token,
+                            "src_flow_usdc": src_flow,
+                            "dest_flow_usdc": dest_flow,
+                            "src_price_usdc": src_price,
+                            "dest_price_usdc": dest_price,
                             "bar_time_delta_sec": bar_time_delta_sec,
                             "tick_count": tick_count,
                         },
@@ -304,8 +317,25 @@ def generate_pool_bars(  # noqa: C901, PLR0912, PLR0915
         pools_processed,
     )
 
+    # Check if we generated any bars
+    if len(all_bar_rows) == 0:
+        logger.error(
+            "No bars were generated! Check your input data and target_usdc_bar_size.",
+        )
+        msg = "No bars generated - possibly target_usdc_bar_size is too large for the data"
+        raise ValueError(msg)
+
     # Create output DataFrame
     output_df = pl.DataFrame(all_bar_rows)
+
+    # Ensure flow columns are Float64 (both src and dest should be consistent)
+    # Note: dest_flow can be zero, which causes Polars to infer Int64; we explicitly cast to Float64
+    output_df = output_df.with_columns(
+        [
+            pl.col("src_flow_usdc").cast(pl.Float64),
+            pl.col("dest_flow_usdc").cast(pl.Float64),
+        ],
+    )
 
     # Sort by timestamp
     output_df = output_df.sort("bar_close_timestamp")
@@ -313,12 +343,19 @@ def generate_pool_bars(  # noqa: C901, PLR0912, PLR0915
     logger.info("\nBar Statistics:")
     logger.info("  Total messages: %s", f"{len(output_df):,}")
     logger.info("  Unique pools: %d", output_df["pool_id"].n_unique())
-    logger.info("  Unique tokens: %d", output_df["token_id"].n_unique())
+    # Count unique tokens (both src and dest)
+    unique_tokens = set(output_df["src_token_id"].unique()) | set(
+        output_df["dest_token_id"].unique(),
+    )
+    logger.info("  Unique tokens: %d", len(unique_tokens))
     logger.info(
         "  Date range: %s to %s",
         output_df["bar_close_timestamp"].min(),
         output_df["bar_close_timestamp"].max(),
     )
+
+    # Analyze coverage of indirect (non-USDC) swaps
+    _log_indirect_swap_analysis(prices_file, swaps_file, output_df)
 
     logger.info("\nSaving to %s...", output_file)
     output_file.parent.mkdir(parents=True, exist_ok=True)
@@ -328,6 +365,124 @@ def generate_pool_bars(  # noqa: C901, PLR0912, PLR0915
         "Done! Saved %s messages to usdc_bars.parquet",
         f"{len(output_df):,}",
     )
+
+
+def _log_indirect_swap_analysis(
+    prices_file: Path,
+    swaps_file: Path,
+    output_df: pl.DataFrame,
+) -> None:
+    """Analyze coverage of indirect (non-USDC) swaps in generated bars.
+
+    Check if bars are missing indirect swap data and quantify the gap.
+
+    Args:
+        prices_file: Path to prices file.
+        swaps_file: Path to swaps file.
+        output_df: Generated bars DataFrame.
+
+    """
+    logger.info("\n=== INDIRECT SWAP COVERAGE ANALYSIS ===")
+
+    usdc_lower = USDC_ADDRESS.lower()
+
+    # Load data
+    prices_df = pl.read_parquet(prices_file)
+    swaps_df = pl.read_parquet(swaps_file)
+
+    # Join prices with swaps to see all price records and their swap contexts
+    joined = prices_df.join(
+        swaps_df.select(
+            ["pool", "block_timestamp", "transaction_hash", "token0", "token1"],
+        ),
+        on=["pool", "block_timestamp", "transaction_hash"],
+        how="inner",
+    )
+
+    # Classify by swap type
+    direct_usdc = joined.filter(
+        (pl.col("token0") == usdc_lower) | (pl.col("token1") == usdc_lower),
+    )
+    indirect_only = joined.filter(
+        (pl.col("token0") != usdc_lower) & (pl.col("token1") != usdc_lower),
+    )
+
+    logger.info(
+        "Price records from direct USDC swaps: %s",
+        f"{len(direct_usdc):,}",
+    )
+    logger.info(
+        "Price records from indirect swaps (non-USDC pairs): %s",
+        f"{len(indirect_only):,}",
+    )
+
+    if len(indirect_only) > 0:
+        indirect_pool_ids = set(indirect_only["pool"].unique())
+        bars_pool_ids = set(output_df["pool_id"].unique())
+        overlap = indirect_pool_ids & bars_pool_ids
+
+        logger.info(
+            "  Pools with indirect swaps: %d",
+            len(indirect_pool_ids),
+        )
+        logger.info(
+            "  Pools that generated bars: %d",
+            len(bars_pool_ids),
+        )
+        logger.info(
+            "  Overlap (indirect swaps in pools with bars): %d",
+            len(overlap),
+        )
+
+        if len(overlap) == 0:
+            logger.warning(
+                "  ⚠ NO INDIRECT SWAP POOLS generated bars! "
+                "All %s indirect swap price records were lost.",
+                f"{len(indirect_only):,}",
+            )
+            logger.warning(
+                "  This suggests all bars come exclusively from USDC-paired swaps.",
+            )
+        else:
+            logger.info(
+                "  ✓ Some indirect swap pools have bars: %d pools",
+                len(overlap),
+            )
+
+    # Token pair coverage
+    logger.info("\n=== TOKEN PAIR TYPES IN BARS ===")
+    bars_with_usdc = len(
+        output_df.filter(
+            (pl.col("src_token_id") == usdc_lower)
+            | (pl.col("dest_token_id") == usdc_lower),
+        ),
+    )
+    bars_without_usdc = len(
+        output_df.filter(
+            (pl.col("src_token_id") != usdc_lower)
+            & (pl.col("dest_token_id") != usdc_lower),
+        ),
+    )
+
+    logger.info(
+        "  Bars with USDC: %s (%.1f%%)",
+        f"{bars_with_usdc:,}",
+        bars_with_usdc / len(output_df) * 100 if len(output_df) > 0 else 0,
+    )
+    logger.info(
+        "  Bars without USDC: %s (%.1f%%)",
+        f"{bars_without_usdc:,}",
+        bars_without_usdc / len(output_df) * 100 if len(output_df) > 0 else 0,
+    )
+
+    if bars_without_usdc == 0 and len(indirect_only) > 0:
+        logger.warning(
+            "  ⚠ No bars between non-USDC token pairs despite %s "
+            "indirect swap price records available!",
+            f"{len(indirect_only):,}",
+        )
+    elif bars_without_usdc > 0:
+        logger.info("  ✓ Non-USDC token pair bars present: good for TGNN!")
 
 
 def _log_null_checks(df_bars: pl.DataFrame) -> bool:
@@ -365,33 +520,56 @@ def _log_volume_checks(df_bars: pl.DataFrame) -> bool:
     """
     logger.info("\n=== VOLUME CHECKS ===")
 
-    # Net flow can be positive (buying token) or negative (selling token/USDC)
-    # This is expected behavior and represents flow direction
-    positive_flows = df_bars.filter(pl.col("net_flow_usdc") > 0)
-    negative_flows = df_bars.filter(pl.col("net_flow_usdc") < 0)
-    zero_flows = df_bars.filter(pl.col("net_flow_usdc") == 0)
+    # Check src flow distribution
+    src_positive = df_bars.filter(pl.col("src_flow_usdc") > 0)
+    src_negative = df_bars.filter(pl.col("src_flow_usdc") < 0)
+    src_zero = df_bars.filter(pl.col("src_flow_usdc") == 0)
 
-    pos_pct = len(positive_flows) / len(df_bars) * 100
-    neg_pct = len(negative_flows) / len(df_bars) * 100
-    zero_pct = len(zero_flows) / len(df_bars) * 100
-
-    logger.info("  Net flow distribution:")
+    logger.info("  Source flow distribution:")
     logger.info(
-        "    Positive (buying token): %d (%.2f%%)",
-        len(positive_flows),
-        pos_pct,
+        "    Positive: %d (%.2f%%)",
+        len(src_positive),
+        len(src_positive) / len(df_bars) * 100,
     )
     logger.info(
-        "    Negative (selling token): %d (%.2f%%)",
-        len(negative_flows),
-        neg_pct,
+        "    Negative: %d (%.2f%%)",
+        len(src_negative),
+        len(src_negative) / len(df_bars) * 100,
     )
-    logger.info("    Zero-flow bars: %d (%.2f%%)", len(zero_flows), zero_pct)
+    logger.info(
+        "    Zero: %d (%.2f%%)",
+        len(src_zero),
+        len(src_zero) / len(df_bars) * 100,
+    )
+
+    # Check dest flow distribution
+    dest_positive = df_bars.filter(pl.col("dest_flow_usdc") > 0)
+    dest_negative = df_bars.filter(pl.col("dest_flow_usdc") < 0)
+    dest_zero = df_bars.filter(pl.col("dest_flow_usdc") == 0)
+
+    logger.info("  Destination flow distribution:")
+    logger.info(
+        "    Positive: %d (%.2f%%)",
+        len(dest_positive),
+        len(dest_positive) / len(df_bars) * 100,
+    )
+    logger.info(
+        "    Negative: %d (%.2f%%)",
+        len(dest_negative),
+        len(dest_negative) / len(df_bars) * 100,
+    )
+    logger.info(
+        "    Zero: %d (%.2f%%)",
+        len(dest_zero),
+        len(dest_zero) / len(df_bars) * 100,
+    )
 
     # Critical issue: all flows are zero (no trading activity)
-    has_critical_issue = len(zero_flows) == len(df_bars)
+    has_critical_issue = len(src_zero) == len(df_bars) and len(dest_zero) == len(
+        df_bars,
+    )
     if has_critical_issue:
-        logger.warning("  ⚠ All bars have zero net_flow_usdc (no trading activity)")
+        logger.warning("  ⚠ All bars have zero flows (no trading activity)")
     else:
         logger.info("  ✓ Trading activity detected in bars")
 
@@ -408,13 +586,15 @@ def _log_price_checks(df_bars: pl.DataFrame) -> bool:
         True if negative prices found, False otherwise.
 
     """
-    negative_prices = df_bars.filter(pl.col("token_close_price_usdc") < 0)
-    has_negative_prices = len(negative_prices) > 0
+    negative_src_prices = df_bars.filter(pl.col("src_price_usdc") < 0)
+    negative_dest_prices = df_bars.filter(pl.col("dest_price_usdc") < 0)
+    has_negative_prices = len(negative_src_prices) > 0 or len(negative_dest_prices) > 0
 
     if has_negative_prices:
         logger.warning(
-            "  ⚠ Found %d bars with negative prices",
-            len(negative_prices),
+            "  ⚠ Found %d bars with negative src prices, %d with negative dest prices",
+            len(negative_src_prices),
+            len(negative_dest_prices),
         )
     else:
         logger.info("  ✓ All prices are non-negative")
@@ -430,32 +610,60 @@ def _log_statistics(df_bars: pl.DataFrame) -> None:
 
     """
     logger.info("\n=== PRICE STATISTICS ===")
-    price_stats = df_bars.select(
+    logger.info("  Source token prices:")
+    src_price_stats = df_bars.select(
         [
-            pl.col("token_close_price_usdc").min().alias("min"),
-            pl.col("token_close_price_usdc").max().alias("max"),
-            pl.col("token_close_price_usdc").mean().alias("mean"),
-            pl.col("token_close_price_usdc").std().alias("std"),
+            pl.col("src_price_usdc").min().alias("min"),
+            pl.col("src_price_usdc").max().alias("max"),
+            pl.col("src_price_usdc").mean().alias("mean"),
+            pl.col("src_price_usdc").std().alias("std"),
         ],
     )
-    for col in price_stats.columns:
-        val = price_stats[col][0]
-        logger.info("  %s: %.6f", col, val)
+    for col in src_price_stats.columns:
+        val = src_price_stats[col][0]
+        logger.info("    %s: %.6f", col, val)
+
+    logger.info("  Destination token prices:")
+    dest_price_stats = df_bars.select(
+        [
+            pl.col("dest_price_usdc").min().alias("min"),
+            pl.col("dest_price_usdc").max().alias("max"),
+            pl.col("dest_price_usdc").mean().alias("mean"),
+            pl.col("dest_price_usdc").std().alias("std"),
+        ],
+    )
+    for col in dest_price_stats.columns:
+        val = dest_price_stats[col][0]
+        logger.info("    %s: %.6f", col, val)
 
     logger.info("\n=== VOLUME STATISTICS ===")
-    vol_stats = df_bars.select(
+    logger.info("  Source flow:")
+    src_vol_stats = df_bars.select(
         [
-            pl.col("net_flow_usdc").min().alias("min"),
-            pl.col("net_flow_usdc").max().alias("max"),
-            pl.col("net_flow_usdc").mean().alias("mean"),
-            pl.col("net_flow_usdc").median().alias("median"),
-            pl.col("net_flow_usdc").std().alias("std"),
-            (pl.col("net_flow_usdc") > 0).sum().alias("non_zero_count"),
+            pl.col("src_flow_usdc").min().alias("min"),
+            pl.col("src_flow_usdc").max().alias("max"),
+            pl.col("src_flow_usdc").mean().alias("mean"),
+            pl.col("src_flow_usdc").median().alias("median"),
+            pl.col("src_flow_usdc").std().alias("std"),
         ],
     )
-    for col in vol_stats.columns:
-        val = vol_stats[col][0]
-        logger.info("  %s: %.6f", col, val)
+    for col in src_vol_stats.columns:
+        val = src_vol_stats[col][0]
+        logger.info("    %s: %.6f", col, val)
+
+    logger.info("  Destination flow:")
+    dest_vol_stats = df_bars.select(
+        [
+            pl.col("dest_flow_usdc").min().alias("min"),
+            pl.col("dest_flow_usdc").max().alias("max"),
+            pl.col("dest_flow_usdc").mean().alias("mean"),
+            pl.col("dest_flow_usdc").median().alias("median"),
+            pl.col("dest_flow_usdc").std().alias("std"),
+        ],
+    )
+    for col in dest_vol_stats.columns:
+        val = dest_vol_stats[col][0]
+        logger.info("    %s: %.6f", col, val)
 
 
 def _log_summary(df_bars: pl.DataFrame) -> None:
@@ -468,7 +676,11 @@ def _log_summary(df_bars: pl.DataFrame) -> None:
     logger.info("\n=== SUMMARY ===")
     logger.info("  Total records: %s", f"{len(df_bars):,}")
     logger.info("  Unique pools: %d", df_bars["pool_id"].n_unique())
-    logger.info("  Unique tokens: %d", df_bars["token_id"].n_unique())
+    # Count unique tokens (both src and dest)
+    unique_tokens = set(df_bars["src_token_id"].unique()) | set(
+        df_bars["dest_token_id"].unique(),
+    )
+    logger.info("  Unique tokens: %d", len(unique_tokens))
     logger.info(
         "  Date range: %s to %s",
         df_bars["bar_close_timestamp"].min(),
@@ -581,10 +793,11 @@ def _validate_against_coingecko(
         token_name = str(info.get("symbol", address[:10]))
         logger.info("%s:", token_name)
 
-        # Get our volume bars for this token
-        df_our_bars = df_bars.filter(pl.col("token_id") == address)
+        # Get our volume bars for this token (check both src and dest)
+        df_our_bars_src = df_bars.filter(pl.col("src_token_id") == address)
+        df_our_bars_dest = df_bars.filter(pl.col("dest_token_id") == address)
 
-        if len(df_our_bars) == 0:
+        if len(df_our_bars_src) == 0 and len(df_our_bars_dest) == 0:
             logger.info("  ⚠ No volume bars in our data")
             continue
 
@@ -594,19 +807,40 @@ def _validate_against_coingecko(
 
         df_cg = coingecko_prices[address]
 
-        # Aggregate our bars to calendar-day volumes
-        df_our_daily = (
-            df_our_bars.with_columns(
+        # Aggregate our bars to calendar-day volumes (combine src and dest)
+        df_our_daily_src = (
+            df_our_bars_src.with_columns(
                 pl.col("bar_close_timestamp").dt.truncate("1d").alias("date"),
             )
             .group_by("date")
             .agg(
                 [
-                    pl.col("net_flow_usdc").sum().alias("our_volume"),
-                    pl.col("token_close_price_usdc").mean().alias("avg_price"),
+                    pl.col("src_price_usdc").mean().alias("avg_price"),
                 ],
             )
             .with_columns(pl.col("date").cast(pl.Date))
+        )
+
+        df_our_daily_dest = (
+            df_our_bars_dest.with_columns(
+                pl.col("bar_close_timestamp").dt.truncate("1d").alias("date"),
+            )
+            .group_by("date")
+            .agg(
+                [
+                    pl.col("dest_price_usdc").mean().alias("avg_price"),
+                ],
+            )
+            .with_columns(pl.col("date").cast(pl.Date))
+        )
+
+        # Combine and average prices from both src and dest appearances
+        df_our_daily = (
+            pl.concat([df_our_daily_src, df_our_daily_dest])
+            .group_by("date")
+            .agg(
+                pl.col("avg_price").mean().alias("avg_price"),
+            )
             .sort("date")
         )
 
@@ -741,7 +975,7 @@ def main(
         help="Input swaps parquet file",
     ),
     prices_file: Path = typer.Option(
-        Path("data/usdc_prices_timeseries.parquet"),
+        Path("data/usdc_priced_swaps.parquet"),
         "--prices-file",
         help="Input prices parquet file",
     ),

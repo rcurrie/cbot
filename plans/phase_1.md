@@ -10,6 +10,7 @@ Wrangle raw swap data downloaded from google big query into a series of USDC pri
 **Milestone 1: Data Ingestion and Uniswap V3 Filtering**
 
 - **Goal:** Read the raw swap data, isolate the relevant Uniswap V3 events, and create a clean, consolidated dataset.
+- **Script:** [src/filter_and_decode_swaps.py](../src/filter_and_decode_swaps.py)
 - **Tasks:**
   1.  Implement a script to recursively load all `.parquet` files from the `data/swaps/` directory using `polars`.
   2.  Apply filters to keep only transactions corresponding to Uniswap V3 "Swap" events.

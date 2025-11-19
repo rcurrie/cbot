@@ -351,31 +351,35 @@ def filter_and_decode_usdc_swaps(
 
     # Analyze USDC coverage
     logger.info("USDC Coverage Analysis:")
-    swaps_with_usdc = df_final.filter(
-        (pl.col("token0") == USDC_ADDRESS.lower())
-        | (pl.col("token1") == USDC_ADDRESS.lower()),
-    )
-    swaps_without_usdc = df_final.filter(
-        (pl.col("token0") != USDC_ADDRESS.lower())
-        & (pl.col("token1") != USDC_ADDRESS.lower()),
-    )
-
     logger.info("  Total swaps: %s", f"{len(df_final):,}")
-    logger.info(
-        "  Swaps with direct USDC: %s (%.2f%%)",
-        f"{len(swaps_with_usdc):,}",
-        len(swaps_with_usdc) / len(df_final) * 100 if len(df_final) > 0 else 0,
-    )
-    logger.info(
-        "  Swaps between USDC-paired tokens: %s (%.2f%%)",
-        f"{len(swaps_without_usdc):,}",
-        len(swaps_without_usdc) / len(df_final) * 100 if len(df_final) > 0 else 0,
-    )
 
     usdc_as_token0 = len(df_final.filter(pl.col("token0") == USDC_ADDRESS.lower()))
     usdc_as_token1 = len(df_final.filter(pl.col("token1") == USDC_ADDRESS.lower()))
     logger.info("  USDC as token0: %s", f"{usdc_as_token0:,}")
     logger.info("  USDC as token1: %s", f"{usdc_as_token1:,}")
+
+    swaps_with_usdc = df_final.filter(
+        (pl.col("token0") == USDC_ADDRESS.lower())
+        | (pl.col("token1") == USDC_ADDRESS.lower()),
+    )
+    logger.info(
+        "  Swaps between USDC and a token: %s (%.2f%%)",
+        f"{len(swaps_with_usdc):,}",
+        len(swaps_with_usdc) / len(df_final) * 100 if len(df_final) > 0 else 0,
+    )
+
+    swaps_without_usdc = df_final.filter(
+        (pl.col("token0") != USDC_ADDRESS.lower())
+        & (pl.col("token1") != USDC_ADDRESS.lower()),
+    )
+    logger.info(
+        "  Swaps where neither token is USDC: %s (%.2f%%)",
+        f"{len(swaps_without_usdc):,}",
+        len(swaps_without_usdc) / len(df_final) * 100 if len(df_final) > 0 else 0,
+    )
+
+    all_tokens = set(df_final["token0"]).union(set(df_final["token1"]))
+    logger.info("  Total unique tokens in final dataset: %d", len(all_tokens))
 
     logger.info("Saving to %s...", output_file)
     output_file.parent.mkdir(parents=True, exist_ok=True)

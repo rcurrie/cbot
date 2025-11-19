@@ -550,13 +550,36 @@ def calculate_usdc_prices(  # noqa: PLR0915
                     token0_usdc_price = price_cache[token0_addr]
                     inferred_token1_price = token1_in_token0 * token0_usdc_price
 
-                    # Update cache with inferred price
+                    # Price of token0 in terms of token1
+                    token0_in_token1 = amount1_real / amount0_real
+
+                    # Use cached USDC price for token1 to infer token0's USDC price
+                    token1_usdc_price = price_cache[token1_addr]
+                    inferred_token0_price = token0_in_token1 * token1_usdc_price
+
+                    # Update cache with inferred prices
                     price_cache[token1_addr] = inferred_token1_price
+                    price_cache[token0_addr] = inferred_token0_price
 
-                    # Estimate USDC volume using token0's price
-                    usdc_volume_estimate = amount0_real * token0_usdc_price
+                    # Estimate USDC volume using average of both prices
+                    usdc_volume_estimate_token0 = amount0_real * inferred_token0_price
+                    usdc_volume_estimate_token1 = amount1_real * inferred_token1_price
+                    usdc_volume_estimate = (
+                        usdc_volume_estimate_token0 + usdc_volume_estimate_token1
+                    ) / 2.0
 
-                    # Add price observations for both tokens
+                    # Add price observations for BOTH tokens
+                    decoded_data.append(
+                        {
+                            "block_timestamp": row["block_timestamp"],
+                            "block_number": row["block_number"],
+                            "transaction_hash": row["transaction_hash"],
+                            "pool": row["pool"],
+                            "token_address": token0_addr,
+                            "price_in_usdc": inferred_token0_price,
+                            "usdc_volume": usdc_volume_estimate,
+                        },
+                    )
                     decoded_data.append(
                         {
                             "block_timestamp": row["block_timestamp"],
@@ -615,7 +638,7 @@ def main(
         help="Input parquet file with decoded swaps (from filter_and_decode_swaps.py)",
     ),
     output_file: Path = typer.Option(
-        Path("data/usdc_prices_timeseries.parquet"),
+        Path("data/usdc_priced_swaps.parquet"),
         "--output-file",
         help="Output parquet file for price time series",
     ),

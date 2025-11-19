@@ -25,7 +25,7 @@ Transform the stationary price data from phase 2 into classification labels usin
   - `--volatility_window`: Rolling window for volatility calculation. Default: 20
 - **Task:**
   1. Load the `log_fracdiff_price.parquet` file.
-  2. **Group the DataFrame by `token_id`** (each token must be processed independently).
+  2. **Group the DataFrame by `dest_token_id`** (each destination token must be processed independently - we're predicting the price movement of the token being bought).
   3. For _each token group_:
      - Sort by `bar_close_timestamp` to ensure chronological order.
      - Calculate rolling volatility: compute a rolling standard deviation of `y_target_fracdiff` over the last `--volatility_window` bars for each bar `t`.
@@ -61,6 +61,33 @@ Transform the stationary price data from phase 2 into classification labels usin
   - Verify that `sample_weight` values are reasonable (between 0 and 1, with mean typically > 0.5).
   - Plot example barrier events for a few tokens to visually confirm correct labeling.
   - Confirm that rows at the end of each token's time series are dropped appropriately (last `N` bars).
+
+---
+
+## Column Reference: `data/labeled_log_fracdiff_price.parquet`
+
+| Column Name           | Type           | Source    | Description                                                                                                                              |
+| --------------------- | -------------- | --------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
+| `bar_close_timestamp` | datetime64[ns] | Inherited | Unix timestamp of the bar close time                                                                                                     |
+| `pool_id`             | str            | Inherited | Unique identifier for the pool                                                                                                           |
+| `src_token_id`        | str            | Inherited | Source token address (token being sold/flowing out)                                                                                      |
+| `dest_token_id`       | str            | Inherited | Destination token address (token being bought/flowing in)                                                                                |
+| `src_flow_usdc`       | float64        | Inherited | Signed net flow in USDC for source token (typically negative when selling)                                                               |
+| `dest_flow_usdc`      | float64        | Inherited | Signed net flow in USDC for destination token (typically positive when buying)                                                           |
+| `src_price_usdc`      | float64        | Inherited | USDC price of source token at bar close                                                                                                  |
+| `dest_price_usdc`     | float64        | Inherited | USDC price of destination token at bar close                                                                                             |
+| `y_target_fracdiff`   | float64        | Inherited | Fractional differenced price target (log returns, stationary) - calculated on destination token price                                    |
+| `label`               | int8           | **NEW**   | Triple-Barrier Method classification label: `+1` (take profit), `-1` (stop loss), `0` (time limit)                                       |
+| `barrier_touch_bars`  | int16          | **NEW**   | Number of bars into the future until a barrier was touched                                                                               |
+| `sample_weight`       | float32        | **NEW**   | Concurrency-adjusted weight (0.0–1.0) accounting for overlapping labels; used during model training to reduce bias from temporal overlap |
+| `rolling_volatility`  | float32        | **NEW**   | Rolling standard deviation of `y_target_fracdiff` over `--volatility_window` bars; used to compute barrier distances                     |
+
+### Notes:
+
+- All rows where labels cannot be computed (last `N` bars per token) are **dropped**.
+- `sample_weight` follows the formula: $\text{weight} = \frac{1}{n_{\text{concurrent}}}$ where $n_{\text{concurrent}}$ is the count of overlapping labels at time $t$.
+- Barrier distances are computed as: Upper = $\text{price}_t \times (1 + \text{vol}_t \times C_1)$, Lower = $\text{price}_t \times (1 - \text{vol}_t \times C_2)$.
+- Use `label` as the target for binary/multiclass classification models and `sample_weight` as sample weights during training.
 
 ---
 

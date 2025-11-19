@@ -120,22 +120,22 @@ def _process_token_group(
     d_max: float,
     d_step: float,
 ) -> tuple[pl.DataFrame | None, dict[str, object]]:
-    """Process a single token group for stationarity.
+    """Process a single source token group for stationarity.
 
     Args:
-        token_id: Token identifier.
-        token_df: DataFrame for this token.
+        token_id: Source token identifier.
+        token_df: DataFrame for this source token (rows sorted by timestamp).
         d_min: Minimum d to search.
         d_max: Maximum d to search.
         d_step: Step size for d search.
 
     Returns:
         Tuple of (processed_df, token_stats_dict). processed_df is None if token
-        should be skipped.
+        should be skipped (non-stationary or invalid data).
 
     """
-    # Get price series
-    prices = token_df["token_close_price_usdc"].to_numpy()
+    # Get source price series
+    prices = token_df["src_price_usdc"].to_numpy()
 
     # Apply log transformation
     log_prices = np.log(prices)
@@ -221,13 +221,13 @@ def make_stationary(
     logger.info("Loading data from %s...", input_file)
     df = pl.read_parquet(input_file)
     logger.info(
-        "Loaded %s messages for %d tokens",
+        "Loaded %s bar events for %d source tokens",
         f"{len(df):,}",
-        df["token_id"].n_unique(),
+        df["src_token_id"].n_unique(),
     )
 
-    # Sort by token_id and timestamp for proper time series processing
-    df = df.sort(["token_id", "bar_close_timestamp"])
+    # Sort by src_token_id and timestamp for proper time series processing
+    df = df.sort(["src_token_id", "bar_close_timestamp"])
 
     logger.info("\nProcessing tokens to achieve stationarity...")
     logger.info(
@@ -237,11 +237,11 @@ def make_stationary(
         d_step,
     )
 
-    # Process each token group
+    # Process each source token group
     all_fracdiff_rows: list[pl.DataFrame] = []
     token_stats: list[dict[str, object]] = []
 
-    for token_tuple, token_group in df.group_by("token_id", maintain_order=True):
+    for token_tuple, token_group in df.group_by("src_token_id", maintain_order=True):
         token_id = token_tuple[0]  # Extract scalar from tuple
         token_df = token_group.sort("bar_close_timestamp")
 
@@ -272,7 +272,7 @@ def make_stationary(
     n_dropped = n_before - n_after
 
     logger.info(
-        "Dropped %s rows with NaN values (%.1f%%)",
+        "Dropped %s bar events with NaN fracdiff values (%.1f%%)",
         f"{n_dropped:,}",
         100 * n_dropped / n_before if n_before > 0 else 0,
     )
@@ -287,7 +287,7 @@ def make_stationary(
     result_df.write_parquet(output_file)
 
     logger.info(
-        "Done! Saved %s messages to %s",
+        "Done! Saved %s bar events with stationary targets to %s",
         f"{len(result_df):,}",
         output_file.name,
     )
@@ -332,8 +332,8 @@ def _log_stationarity_stats(
 def _log_output_stats(result_df: pl.DataFrame) -> None:
     """Log final output dataset statistics."""
     logger.info("\nOutput Dataset:")
-    logger.info("  Total messages: %s", f"{len(result_df):,}")
-    logger.info("  Unique tokens: %d", result_df["token_id"].n_unique())
+    logger.info("  Total bar events: %s", f"{len(result_df):,}")
+    logger.info("  Unique source tokens: %d", result_df["src_token_id"].n_unique())
     logger.info("  Unique pools: %d", result_df["pool_id"].n_unique())
     logger.info(
         "  Date range: %s to %s",
@@ -372,10 +372,10 @@ def validate_output(
 
     # Check required columns
     required_cols = {
-        "token_id",
+        "src_token_id",
         "pool_id",
         "bar_close_timestamp",
-        "token_close_price_usdc",
+        "src_price_usdc",
         "y_target_fracdiff",
     }
     missing_cols = required_cols - set(df.columns)
@@ -386,13 +386,13 @@ def validate_output(
 
     # Check data types
     logger.info("  Column data types:")
-    for col in ["y_target_fracdiff", "token_close_price_usdc"]:
+    for col in ["y_target_fracdiff", "src_price_usdc"]:
         dtype = df.select(col).dtypes[0]
         logger.info("    %s: %s", col, dtype)
 
     # Check for NaNs in critical columns
     nan_counts: dict[str, int] = {}
-    for col_name in ["token_id", "pool_id", "y_target_fracdiff"]:
+    for col_name in ["src_token_id", "pool_id", "y_target_fracdiff"]:
         nan_count = df.filter(pl.col(col_name).is_null()).height
         nan_counts[col_name] = nan_count
         if nan_count > 0:
@@ -419,9 +419,9 @@ def validate_output(
         )
 
     # Check unique token counts
-    n_tokens = df["token_id"].n_unique()
+    n_tokens = df["src_token_id"].n_unique()
     n_pools = df["pool_id"].n_unique()
-    logger.info("  ✓ Unique tokens: %d", n_tokens)
+    logger.info("  ✓ Unique source tokens: %d", n_tokens)
     logger.info("  ✓ Unique pools: %d", n_pools)
 
     # Check date range

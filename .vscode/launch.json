@@ -8,5 +8,15 @@
             "program": "${file}",
             "console": "integratedTerminal"
         },
+        {
+            "name": "Python Debugger: Current File Verbose",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${file}",
+            "console": "integratedTerminal",
+            "args": [
+                "--verbose"
+            ]
+        }
     ]
 }

@@ -2,7 +2,7 @@
 
 This script implements Milestone 1 of Phase 3:
 - Load log_fracdiff_price.parquet
-- Group by token_id
+- Group by src_token_id
 - Calculate rolling volatility for each token
 - Apply triple-barrier method to generate labels
 - Handle label overlap/concurrency with sample weights
@@ -225,7 +225,7 @@ def _log_output_statistics(result_df: pl.DataFrame, verbose: bool) -> None:
     """
     logger.info("\nOutput Dataset:")
     logger.info("  Total labeled messages: %s", f"{len(result_df):,}")
-    logger.info("  Unique tokens: %d", result_df["token_id"].n_unique())
+    logger.info("  Unique tokens: %d", result_df["src_token_id"].n_unique())
     logger.info("  Unique pools: %d", result_df["pool_id"].n_unique())
 
     if not verbose:
@@ -275,7 +275,7 @@ def label_triple_barrier(
     logger.info(
         "Loaded %s messages for %d tokens",
         f"{len(df):,}",
-        df["token_id"].n_unique(),
+        df["src_token_id"].n_unique(),
     )
 
     logger.info("\nTriple-Barrier Parameters:")
@@ -284,15 +284,15 @@ def label_triple_barrier(
     logger.info("  Vertical bars (N): %d", vertical_bars)
     logger.info("  Volatility window: %d", volatility_window)
 
-    # Sort by token_id and timestamp
-    df = df.sort(["token_id", "bar_close_timestamp"])
+    # Sort by src_token_id and timestamp
+    df = df.sort(["src_token_id", "bar_close_timestamp"])
 
     # Process each token group
     logger.info("\nProcessing tokens to generate labels...")
     all_labeled_rows = []
     token_stats = []
 
-    for token_tuple, token_group in df.group_by("token_id", maintain_order=True):
+    for token_tuple, token_group in df.group_by("src_token_id", maintain_order=True):
         token_id = token_tuple[0]
         token_df = token_group.sort("bar_close_timestamp")
 
@@ -419,7 +419,7 @@ def validate_output(output_file: Path, verbose: bool = False) -> None:
 
     # Verify required columns
     required_columns = {
-        "token_id",
+        "src_token_id",
         "pool_id",
         "bar_close_timestamp",
         "y_target_fracdiff",
@@ -434,7 +434,7 @@ def validate_output(output_file: Path, verbose: bool = False) -> None:
         raise ValueError(msg)
 
     logger.info("  Rows: %s", f"{len(df):,}")
-    logger.info("  Unique tokens: %d", df["token_id"].n_unique())
+    logger.info("  Unique tokens: %d", df["src_token_id"].n_unique())
     logger.info("  Columns: %d", len(df.columns))
 
     if not verbose:
