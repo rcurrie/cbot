@@ -64,6 +64,11 @@ logger.info("Loading labeled bars from %s", DATA_PATH)
 df = pl.read_parquet(DATA_PATH).sort("bar_close_timestamp")
 logger.info("Bars loaded: %s", f"{df.shape[0]:,}")
 
+# Filter out rows where dest_fracdiff is null (preprocessing artifact)
+# src_fracdiff nulls already redacted; dest_fracdiff nulls lack stationarity signal
+df = df.filter(pl.col("dest_fracdiff").is_not_null())
+logger.info("After filtering null dest_fracdiff: %s", f"{df.shape[0]:,}")
+
 # %%
 # Encode token IDs (0-indexed for TGM)
 logger.info("Encoding token IDs")
@@ -102,16 +107,18 @@ timestamps_sec = (
 # Edge features: pack financial metrics for temporal memory updates
 # Per Prado: src_fracdiff and dest_fracdiff are IID stationary streams
 # key to the model's learning signal
+# sample_weight handles overlapping labels (concurrency) per Prado
 edge_feats = (
     df.select(
         [
             "src_fracdiff",
-            # "dest_fracdiff", may have nulls...
+            "dest_fracdiff",
             "src_flow_usdc",
             "dest_flow_usdc",
             "tick_count",
             "rolling_volatility",
             "bar_time_delta_sec",
+            "sample_weight",
         ],
     )
     .fill_null(0.0)
@@ -294,6 +301,13 @@ def train_epoch(
         batch.dynamic_node_feats = batch.dynamic_node_feats.to(device)
         batch.node_ids = batch.node_ids.to(device)
 
+        # Extract sample weights (Prado: handles overlapping labels)
+        # Sample weights are in edge_feats[:, -1] (last column)
+        if batch.edge_feats is not None:
+            sample_weights = batch.edge_feats[:, -1].to(device)
+        else:
+            sample_weights = None
+
         # Forward pass
         optimizer.zero_grad()
         logits = model(batch, static_node_feats)
@@ -304,8 +318,17 @@ def train_epoch(
         # Target labels (extract from dynamic_node_feats and convert to LongTensor)
         y_true = batch.dynamic_node_feats.long().squeeze(-1)
 
-        # Compute loss and backprop
+        # Compute loss with sample weights
         loss = criterion(logits, y_true)
+
+        # Apply sample weights if available
+        if sample_weights is not None:
+            # Ensure weights align with predictions
+            if len(sample_weights) == len(logits):
+                loss = (loss * sample_weights).mean()
+            else:
+                loss = loss.mean()
+
         loss.backward()
         optimizer.step()
 
