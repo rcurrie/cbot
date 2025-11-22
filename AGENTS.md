@@ -6,6 +6,13 @@ Machine Learning driven Crypto Trading System using Decentralized Exchange (DEX)
 
 NEVER DELETE A FILE WITHOUT EXPRESS PERMISSION FROM ME OR A DIRECT COMMAND FROM ME.
 
+# Python Standards
+
+- Always use uv to run python, ruff and other tools
+- Only use uv, NEVER pip, to manage packages
+- Virtual env managed by uv in .venv which you can assume is activated
+- Python 3.14 and higher (NOT pip/poetry/conda!)
+
 # Coding Philosophy
 
 - **Simplicity and reliability first** - this is a trading system where bugs are costly
@@ -21,13 +28,6 @@ NEVER DELETE A FILE WITHOUT EXPRESS PERMISSION FROM ME OR A DIRECT COMMAND FROM 
 - One off validation scripts go in plans/<milestone_name>/ (not part of main system)
 - Data artifacts used between scripts such as parquet files go in data/
 - Scripts and notebooks run from the project root so use root relative paths
-
-# Python Standards
-
-- Use uv to run all command line tools
-- Only use uv, NEVER pip.
-- Virtual env managed by uv in .venv which you can assume is activated
-- Python 3.14 and higher (NOT pip/poetry/conda!)
 
 # Type Safety & Linting
 
