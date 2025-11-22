@@ -53,6 +53,7 @@ dev = [
     "mypy>=1.18.2",
     "py-tgb>=2.2.0",
     "ruff>=0.14.4",
+    "scikit-learn-stubs>=0.0.3",
 ]
 
 [tool.uv.sources]
