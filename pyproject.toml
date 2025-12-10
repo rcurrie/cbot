@@ -54,6 +54,7 @@ dev = [
     "py-tgb>=2.2.0",
     "ruff>=0.14.4",
     "scikit-learn-stubs>=0.0.3",
+    "types-tqdm>=4.67.0.20250809",
 ]
 
 [tool.uv.sources]

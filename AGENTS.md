@@ -12,6 +12,7 @@ NEVER DELETE A FILE WITHOUT EXPRESS PERMISSION FROM ME OR A DIRECT COMMAND FROM 
 - Only use uv, NEVER pip, to manage packages
 - Virtual env managed by uv in .venv which you can assume is activated
 - Python 3.14 and higher (NOT pip/poetry/conda!)
+- Line lenghts should be limited to 88
 
 # Coding Philosophy
 

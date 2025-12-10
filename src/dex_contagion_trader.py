@@ -24,9 +24,9 @@ import numpy as np
 import polars as pl
 import torch
 from sklearn.preprocessing import LabelEncoder
-from tgm import DGraph
-from tgm.data import DGData, DGDataLoader
-from tgm.nn import TGCN, NodePredictor
+from tgm import DGBatch, DGraph  # type: ignore[import-untyped]
+from tgm.data import DGData, DGDataLoader  # type: ignore[import-untyped]
+from tgm.nn import TGCN, NodePredictor  # type: ignore[import-untyped]
 from torch import nn
 from tqdm import tqdm
 
@@ -39,10 +39,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Storage locations
+DATA_PATH = Path("data/labeled_log_fracdiff_price.parquet")
+TOKENS_PATH = Path("data/tokens.json")
+
 CHECKPOINT_DIR = Path("data/checkpoints")
 CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
-
-DATA_PATH = Path("data/labeled_log_fracdiff_price.parquet")
 
 # Backtest parameters
 TRAIN_WINDOW_DAYS = 5
@@ -52,11 +54,12 @@ SLIDE_STEP_DAYS = 1
 TRADING_DAYS = 3
 
 # Model hyperparameters
-EMBED_DIM = 64
+NODE_EMBED_DIM = 64
 HIDDEN_DIM = 64
 NUM_CLASSES = 3  # down (0), stay (1), up (2)
 LABEL_UP = 2
-BATCH_TIME_GRAN = "h"
+BATCH_SIZE = 100
+BATCH_UNIT = "s"  # Batch by 100 seconds (which are events in our case)
 LEARNING_RATE = 1e-3
 DEVICE = (
     "cuda"
@@ -76,10 +79,9 @@ logger.info(
     TRADE_WINDOW_HOURS[1],
 )
 
-
 # %%
 # Load token metadata from tokens.json
-with Path("data/tokens.json").open() as f:
+with TOKENS_PATH.open() as f:
     tokens_metadata: dict[str, dict[str, Any]] = json.load(f)
 
 # %%
@@ -92,6 +94,26 @@ logger.info("Bars loaded: %s", f"{df.shape[0]:,}")
 df = df.filter(pl.col("dest_fracdiff").is_not_null())
 logger.info("After filtering null dest_fracdiff: %s", f"{df.shape[0]:,}")
 
+# Filter out rows with NaN in edge features and labels
+edge_cols = [
+    "src_fracdiff",
+    "dest_fracdiff",
+    "src_flow_usdc",
+    "dest_flow_usdc",
+    "tick_count",
+    "rolling_volatility",
+    "bar_time_delta_sec",
+    "label",
+    "sample_weight",
+]
+for col in edge_cols:
+    df = df.filter(pl.col(col).is_not_null())
+    # Also filter NaNs for float columns
+    if df.schema[col] in (pl.Float32, pl.Float64):
+        df = df.filter(pl.col(col).is_finite())
+
+
+# %%
 # Encode token IDs (0-indexed for TGM)
 logger.info("Encoding token IDs")
 le = LabelEncoder()
@@ -117,20 +139,22 @@ logger.info(
     len(unique_dates),
 )
 
-src = le.transform(df["src_token_id"].to_numpy()).astype(np.int32)
-dst = le.transform(df["dest_token_id"].to_numpy()).astype(np.int32)
-
 
 # %%
 # Model architecture
 class TokenPredictorModel(nn.Module):
-    """TGCN encoder + decoder for token price movement prediction."""
+    """TGCN encoder + decoder for token price movement prediction.
+
+    Architecture:
+    - Node embeddings: Learnable parameters initialized randomly, updated via backprop
+    - TGCN encoder: Refines embeddings using temporal swaps (unsupervised)
+    - Predictor: Maps refined embeddings to price predictions (supervised via labels)
+    """
 
     def __init__(
         self,
         num_nodes: int,
-        static_feat_dim: int,
-        embed_dim: int,
+        node_embed_dim: int,
         output_dim: int,
         device: str = "cpu",
     ) -> None:
@@ -138,9 +162,8 @@ class TokenPredictorModel(nn.Module):
 
         Args:
             num_nodes: Total number of tokens in graph.
-            static_feat_dim: Dimension of static node features.
-            embed_dim: Embedding dimension for TGCN.
-            output_dim: Number of output classes.
+            node_embed_dim: Embedding dimension (used for node embeddings and TGCN).
+            output_dim: Number of output classes (3: down/stay/up).
             device: Device to place tensors on.
 
         """
@@ -148,78 +171,74 @@ class TokenPredictorModel(nn.Module):
         self.num_nodes = num_nodes
         self.device = device
 
-        self.tgcn = TGCN(
-            in_channels=static_feat_dim,
-            out_channels=embed_dim,
+        # Learnable node embeddings - initialized randomly, updated via backprop
+        # Refined by TGCN via message passing on the swap graph
+        self.node_embeddings = nn.Parameter(
+            torch.randn(num_nodes, node_embed_dim, device=device),
         )
-        self.decoder = NodePredictor(
-            in_dim=embed_dim,
+
+        # TGCN encoder: refines embeddings using temporal swap graph structure
+        self.tgcn = TGCN(
+            in_channels=node_embed_dim,
+            out_channels=node_embed_dim,
+        )
+
+        # Predictor: maps refined embeddings to class predictions
+        self.predictor = NodePredictor(
+            in_dim=node_embed_dim,
             out_dim=output_dim,
-            hidden_dim=embed_dim,
+            hidden_dim=node_embed_dim,
         )
 
     def forward(
         self,
-        batch: "DGBatch",  # noqa: F821
-        static_node_feats: torch.Tensor,
+        batch: "DGBatch",
     ) -> torch.Tensor | None:
-        """Forward pass through encoder and decoder.
+        """Forward pass through encoder and predictor.
 
         Args:
             batch: DGBatch with src, dst, edge_index, node_ids.
-            static_node_feats: [num_nodes, static_feat_dim].
 
         Returns:
             logits: [num_nodes_in_batch, output_dim] or None if no nodes.
 
         """
-        z = self.tgcn(static_node_feats, batch.edge_index)
+        # TGCN takes self.node_embeddings as INPUT
+        # and outputs UPDATED embeddings based on graph structure + messages
+        z = self.tgcn(self.node_embeddings, batch.edge_index)
 
         if batch.node_ids is not None:
+            # Select embeddings for nodes that have labels
             z_node = z[batch.node_ids]
-            return self.decoder(z_node)
+            # Predictor: predict price movement from refined embeddings
+            result: torch.Tensor = self.predictor(z_node)
+            return result
         return None
 
 
-def build_dgdata(
+# %%
+def build_window(
     df_window: pl.DataFrame,
     le: LabelEncoder,
-) -> tuple[DGData, np.ndarray]:
-    """Build DGData from a window of swap bars.
+) -> DGData:
+    """Build a window of swap bars.
 
     Args:
         df_window: DataFrame with swap bars for training window.
         le: LabelEncoder for token IDs.
 
     Returns:
-        Tuple of (DGData object, sample_weights array aligned with node_ids).
+        DGData object with labels and sample_weights packed in dynamic_node_feats.
 
     """
-    # Filter out rows with NaN in edge features and labels
-    edge_cols = [
-        "src_fracdiff",
-        "dest_fracdiff",
-        "src_flow_usdc",
-        "dest_flow_usdc",
-        "tick_count",
-        "rolling_volatility",
-        "bar_time_delta_sec",
-        "label",
-        # "sample_weight",  # Extracted separately for cost weighting, not as edge feature
-    ]
-    for col in edge_cols:
-        df_window = df_window.filter(pl.col(col).is_not_null())
-
-    src = le.transform(df_window["src_token_id"].to_numpy()).astype(np.int32)
-    dst = le.transform(df_window["dest_token_id"].to_numpy()).astype(np.int32)
-
-    timestamps_sec = (
-        (df_window["bar_close_timestamp"] - df_window["bar_close_timestamp"].min())
-        .dt.total_seconds()
-        .cast(pl.Int32)
-        .to_numpy()
-        .astype(np.int32)
+    src = np.asarray(le.transform(df_window["src_token_id"].to_numpy()), dtype=np.int32)
+    dst = np.asarray(
+        le.transform(df_window["dest_token_id"].to_numpy()),
+        dtype=np.int32,
     )
+
+    # Use event index as timestamp to respect dollar bar "information time"
+    timestamps_sec = np.arange(len(df_window), dtype=np.int32)
 
     edge_feats = (
         df_window.select(
@@ -233,24 +252,22 @@ def build_dgdata(
                 "bar_time_delta_sec",
             ],
         )
-        .fill_null(0.0)
         .to_numpy()
         .astype(np.float32)
     )
-    # Replace any remaining NaN with 0
-    edge_feats = np.nan_to_num(edge_feats, nan=0.0)
+    assert not np.isnan(edge_feats).any(), "NaN values found in edge features"
 
     node_timestamps = timestamps_sec
     node_ids = src
-    # Extract sample_weight separately (aligned with node_ids)
-    sample_weights_array = df_window["sample_weight"].to_numpy().astype(np.float32)
-    dynamic_node_feats = (
-        (df_window["label"].fill_null(0).to_numpy().astype(np.int64) + 1)
-        .reshape(-1, 1)
-        .astype(np.float32)
-    )
 
-    dgdata = DGData.from_raw(
+    # Pack labels and weights into dynamic_node_feats
+    labels = (df_window["label"].fill_null(0).to_numpy().astype(np.int64) + 1).astype(
+        np.float32,
+    )
+    weights = df_window["sample_weight"].to_numpy().astype(np.float32)
+    dynamic_node_feats = np.stack((labels, weights), axis=-1)
+
+    return DGData.from_raw(
         edge_timestamps=torch.from_numpy(timestamps_sec),
         edge_index=torch.from_numpy(np.column_stack((src, dst))),
         edge_feats=torch.from_numpy(edge_feats),
@@ -260,36 +277,28 @@ def build_dgdata(
         time_delta="s",
     )
 
-    return dgdata, sample_weights_array
 
-
+# %%
 def train_model(
     model: TokenPredictorModel,
     data: DGData,
-    sample_weights: np.ndarray,
-    static_node_feats: torch.Tensor,
     device: str,
     epochs: int = 1,
 ) -> None:
-    """Train model on a single epoch with Prado concurrency weighting.
+    """Train model with Prado concurrency weighting.
 
     Args:
         model: TokenPredictorModel instance.
         data: DGData with training events.
-        sample_weights: Node-level weights from Prado (1/num_overlapping_labels).
-        static_node_feats: Static node features [num_nodes, embed_dim].
         device: Device for training.
         epochs: Number of epochs (default 1 for sliding backtest).
 
     """
     model.train()
     dg = DGraph(data, device=device)
-    loader = DGDataLoader(dg, batch_unit=BATCH_TIME_GRAN)
+    loader = DGDataLoader(dg, batch_size=BATCH_SIZE, batch_unit=BATCH_UNIT)
     optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
     criterion = nn.CrossEntropyLoss(reduction="none")
-
-    # Convert sample weights to tensor
-    weights_tensor = torch.from_numpy(sample_weights).to(device).float()
 
     for epoch in range(epochs):
         total_loss = 0.0
@@ -309,21 +318,16 @@ def train_model(
             batch.node_ids = batch.node_ids.to(device)
 
             optimizer.zero_grad()
-            logits = model(batch, static_node_feats)
+            logits = model(batch)
 
             if logits is None:
                 continue
 
-            y_true = batch.dynamic_node_feats.long().squeeze(-1)
+            # Unpack labels and weights from dynamic_node_feats
+            y_true = batch.dynamic_node_feats[:, 0].long()
+            batch_weights = batch.dynamic_node_feats[:, 1].float()
 
-            # Get per-node losses (no reduction)
             loss_per_node = criterion(logits, y_true)
-
-            # Get sample weights for nodes in this batch
-            # batch.node_ids contains indices into the original node sequence
-            batch_weights = weights_tensor[batch.node_ids]
-
-            # Apply Prado weighting: scale each node's loss by its concurrency weight
             weighted_loss = (loss_per_node * batch_weights).mean()
 
             weighted_loss.backward()
@@ -339,7 +343,6 @@ def train_model(
 def predict_top_tokens(
     model: TokenPredictorModel,
     data: DGData,
-    static_node_feats: torch.Tensor,
     le: LabelEncoder,
     device: str,
     top_n: int = 5,
@@ -349,7 +352,6 @@ def predict_top_tokens(
     Args:
         model: TokenPredictorModel instance.
         data: DGData for inference.
-        static_node_feats: Static node features.
         le: LabelEncoder for decoding token IDs.
         device: Device for inference.
         top_n: Number of top tokens to return.
@@ -360,7 +362,7 @@ def predict_top_tokens(
     """
     model.eval()
     dg = DGraph(data, device=device)
-    loader = DGDataLoader(dg, batch_unit=BATCH_TIME_GRAN)
+    loader = DGDataLoader(dg, batch_size=BATCH_SIZE, batch_unit=BATCH_UNIT)
 
     token_predictions: dict[int, list[int]] = {}
 
@@ -378,7 +380,7 @@ def predict_top_tokens(
             batch.dynamic_node_feats = batch.dynamic_node_feats.to(device)
             batch.node_ids = batch.node_ids.to(device)
 
-            logits = model(batch, static_node_feats)
+            logits = model(batch)  # <-- No longer pass node_embeddings
             if logits is None:
                 continue
 
@@ -390,7 +392,6 @@ def predict_top_tokens(
                     token_predictions[node_id] = []
                 token_predictions[node_id].append(pred)
 
-    # Calculate bullish scores
     recommendations: list[tuple[str, float]] = []
     for node_id, pred_list in token_predictions.items():
         up_count = sum(1 for p in pred_list if p == LABEL_UP)
@@ -398,7 +399,6 @@ def predict_top_tokens(
         token_addr = le.inverse_transform([node_id])[0]
         recommendations.append((token_addr, bullish_score))
 
-    # Sort by bullish score, return top N
     recommendations.sort(key=lambda x: x[1], reverse=True)
     return recommendations[:top_n]
 
@@ -564,19 +564,13 @@ def backtest_slide() -> None:
     logger.info("SLIDING BACKTEST")
     logger.info("=" * 80)
 
-    # Initialize model and static features
+    # Initialize model (node embeddings are now part of the model)
     model = TokenPredictorModel(
         num_nodes=num_tokens,
-        static_feat_dim=EMBED_DIM,
-        embed_dim=HIDDEN_DIM,
+        node_embed_dim=NODE_EMBED_DIM,  # <-- Simplified: no separate static_feat_dim
         output_dim=NUM_CLASSES,
         device=DEVICE,
     ).to(DEVICE)
-
-    static_node_feats = torch.randn(
-        (num_tokens, EMBED_DIM),
-        device=DEVICE,
-    ).float()
 
     # Extract unique dates for sliding windows
     dates_array = unique_dates["trade_date"].to_list()
@@ -584,29 +578,24 @@ def backtest_slide() -> None:
     # Sliding window: train on 5 days, then trade for next TRADING_DAYS days
     results: list[dict[str, Any]] = []
 
-    for i in range(1):  # Single backtest: train once, then trade for TRADING_DAYS
+    for i in range(1):
         train_start_date = dates_array[i]
         train_end_date = dates_array[i + TRAIN_WINDOW_DAYS - 1]
-        trade_start_date = dates_array[i + TRAIN_WINDOW_DAYS]
 
         logger.info("Training window: %s to %s", train_start_date, train_end_date)
-        logger.info("Trade dates: starting %s", trade_start_date)
 
-        # Build training data
         df_train = df.filter(
             (pl.col("trade_date") >= train_start_date)
             & (pl.col("trade_date") <= train_end_date),
         )
         logger.info("Training events: %s", f"{len(df_train):,}")
 
-        data_train, node_sample_weights = build_dgdata(df_train, le)
+        data_train = build_window(df_train, le)
 
-        # Train model with Prado-weighted loss
+        # Train model - node embeddings updated via backprop
         train_model(
             model,
             data_train,
-            node_sample_weights,
-            static_node_feats,
             DEVICE,
             epochs=EPOCHS,
         )
@@ -617,40 +606,53 @@ def backtest_slide() -> None:
                 break
 
             trade_date = dates_array[i + TRAIN_WINDOW_DAYS + trade_offset]
-            df_trade = df.filter(pl.col("trade_date") == trade_date)
+            df_day = df.filter(pl.col("trade_date") == trade_date)
 
-            if len(df_trade) == 0:
+            if len(df_day) == 0:
                 logger.warning("No data for trade date %s", trade_date)
                 continue
 
-            logger.info(
-                "\nTrade date: %s | Events: %s",
-                trade_date,
-                f"{len(df_trade):,}",
+            # Split into prediction context (pre-9am) and trading window (9am-5pm)
+            trade_start_hour = TRADE_WINDOW_HOURS[0]
+            trade_end_hour = TRADE_WINDOW_HOURS[1]
+
+            df_morning = df_day.filter(
+                pl.col("bar_close_timestamp").dt.hour() < trade_start_hour,
+            )
+            df_trading = df_day.filter(
+                (pl.col("bar_close_timestamp").dt.hour() >= trade_start_hour)
+                & (pl.col("bar_close_timestamp").dt.hour() < trade_end_hour),
             )
 
-            # Make predictions at 9am (stub: use all events up to that date)
-            # Don't need weights for inference
-            data_pred, _ = build_dgdata(df_trade, le)
+            logger.info(
+                "\nTrade date: %s | Morning events: %s | Trading events: %s",
+                trade_date,
+                f"{len(df_morning):,}",
+                f"{len(df_trading):,}",
+            )
+
+            if len(df_morning) == 0:
+                logger.warning("No morning data for %s, skipping", trade_date)
+                continue
+
+            data_pred = build_window(df_morning, le)
             top_tokens = predict_top_tokens(
                 model,
                 data_pred,
-                static_node_feats,
                 le,
                 DEVICE,
                 top_n=TOP_N_TOKENS,
             )
 
-            # Calculate returns (stub: will use dest_price_usdc / src_price_usdc)
-            daily_return = 0.0  # Placeholder
+            logger.info(
+                "Top 5 tokens for %s (based on pre-%d:00 data):",
+                trade_date,
+                trade_start_hour,
+            )
 
-            logger.info("Top 5 tokens for %s:", trade_date)
-
-            # Calculate returns for predicted tokens
-            token_returns = calculate_daily_returns(df_trade, top_tokens, le)
+            token_returns = calculate_daily_returns(df_trading, top_tokens, le)
 
             for rank, (token_addr, score) in enumerate(top_tokens, 1):
-                # Get symbol from metadata, fall back to address
                 token_addr_lower = token_addr.lower()
                 token_meta = tokens_metadata.get(token_addr_lower, {})
                 symbol = token_meta.get("symbol", token_addr[:10])
@@ -663,7 +665,6 @@ def backtest_slide() -> None:
                     daily_return * 100,
                 )
 
-            # Calculate portfolio return (equal-weighted across top 5)
             portfolio_return = np.mean(list(token_returns.values()))
 
             results.append(
@@ -680,7 +681,47 @@ def backtest_slide() -> None:
     compute_backtest_summary(results)
 
 
-# %%
-# Main execution
+def run_training_validation() -> None:
+    """Run a simple training loop for validation."""
+    logger.info("=" * 80)
+    logger.info("TRAINING VALIDATION RUN")
+    logger.info("=" * 80)
+
+    # Initialize model
+    model = TokenPredictorModel(
+        num_nodes=num_tokens,
+        node_embed_dim=NODE_EMBED_DIM,
+        output_dim=NUM_CLASSES,
+        device=DEVICE,
+    ).to(DEVICE)
+
+    # Use first window
+    train_start_date = unique_dates["trade_date"][0]
+    train_end_date = unique_dates["trade_date"][TRAIN_WINDOW_DAYS - 1]
+
+    logger.info("Training window: %s to %s", train_start_date, train_end_date)
+
+    df_train = df.filter(
+        (pl.col("trade_date") >= train_start_date)
+        & (pl.col("trade_date") <= train_end_date),
+    )
+    logger.info("Training events: %s", f"{len(df_train):,}")
+
+    data_train = build_window(df_train, le)
+
+    # Train model for 1 epoch
+    train_model(
+        model,
+        data_train,
+        DEVICE,
+        epochs=1,
+    )
+
+    logger.info("Training validation complete.")
+
+
 if __name__ == "__main__":
-    backtest_slide()
+    # Default to validation run
+    run_training_validation()
+    # To run full backtest:
+    # backtest_slide()
