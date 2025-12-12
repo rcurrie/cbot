@@ -51,7 +51,7 @@ TRAIN_WINDOW_DAYS = 5
 TRADE_WINDOW_HOURS = (9, 17)  # 9am to 5pm EST
 TOP_N_TOKENS = 5
 SLIDE_STEP_DAYS = 1
-TRADING_DAYS = 3
+TRADING_DAYS = 10
 
 # Model hyperparameters
 NODE_EMBED_DIM = 64
@@ -69,7 +69,7 @@ DEVICE = (
     else "cpu"
 )
 
-EPOCHS = 10
+EPOCHS = 75
 
 logger.info(
     "Device: %s | Train window: %d days | Trade hours: %d-%d EST",
@@ -87,8 +87,11 @@ with TOKENS_PATH.open() as f:
 # %%
 # Load and prepare data
 logger.info("Loading labeled bars from %s", DATA_PATH)
-df = pl.read_parquet(DATA_PATH).sort("bar_close_timestamp")
+df = pl.read_parquet(DATA_PATH)
 logger.info("Bars loaded: %s", f"{df.shape[0]:,}")
+
+# Ensure data is sorted by time and token IDs to break ties consistently
+df = df.sort(["bar_close_timestamp", "src_token_id", "dest_token_id"])
 
 # Filter out rows where dest_fracdiff is null
 df = df.filter(pl.col("dest_fracdiff").is_not_null())
@@ -238,7 +241,11 @@ def build_window(
     )
 
     # Use event index as timestamp to respect dollar bar "information time"
-    timestamps_sec = np.arange(len(df_window), dtype=np.int32)
+    # Using int64 (PyTorch standard) and monotonic sequence.
+    timestamps_sec = np.arange(len(df_window), dtype=np.int64)
+    # Note: timestamps_sec is strictly sorted by construction. 
+    # If DGData warns about sorting, it may be an internal check handling equal timestamps conservatively.
+    logger.debug("Timestamps min/max: %d/%d", timestamps_sec[0], timestamps_sec[-1])
 
     edge_feats = (
         df_window.select(
@@ -267,7 +274,7 @@ def build_window(
     weights = df_window["sample_weight"].to_numpy().astype(np.float32)
     dynamic_node_feats = np.stack((labels, weights), axis=-1)
 
-    return DGData.from_raw(
+    g = DGData.from_raw(
         edge_timestamps=torch.from_numpy(timestamps_sec),
         edge_index=torch.from_numpy(np.column_stack((src, dst))),
         edge_feats=torch.from_numpy(edge_feats),
@@ -276,6 +283,7 @@ def build_window(
         dynamic_node_feats=torch.from_numpy(dynamic_node_feats),
         time_delta="s",
     )
+    return g
 
 
 # %%
@@ -681,47 +689,5 @@ def backtest_slide() -> None:
     compute_backtest_summary(results)
 
 
-def run_training_validation() -> None:
-    """Run a simple training loop for validation."""
-    logger.info("=" * 80)
-    logger.info("TRAINING VALIDATION RUN")
-    logger.info("=" * 80)
-
-    # Initialize model
-    model = TokenPredictorModel(
-        num_nodes=num_tokens,
-        node_embed_dim=NODE_EMBED_DIM,
-        output_dim=NUM_CLASSES,
-        device=DEVICE,
-    ).to(DEVICE)
-
-    # Use first window
-    train_start_date = unique_dates["trade_date"][0]
-    train_end_date = unique_dates["trade_date"][TRAIN_WINDOW_DAYS - 1]
-
-    logger.info("Training window: %s to %s", train_start_date, train_end_date)
-
-    df_train = df.filter(
-        (pl.col("trade_date") >= train_start_date)
-        & (pl.col("trade_date") <= train_end_date),
-    )
-    logger.info("Training events: %s", f"{len(df_train):,}")
-
-    data_train = build_window(df_train, le)
-
-    # Train model for 1 epoch
-    train_model(
-        model,
-        data_train,
-        DEVICE,
-        epochs=1,
-    )
-
-    logger.info("Training validation complete.")
-
-
 if __name__ == "__main__":
-    # Default to validation run
-    run_training_validation()
-    # To run full backtest:
-    # backtest_slide()
+    backtest_slide()
