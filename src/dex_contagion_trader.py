@@ -20,6 +20,7 @@ import logging
 from pathlib import Path
 from typing import Any
 
+import click
 import numpy as np
 import polars as pl
 import torch
@@ -51,7 +52,6 @@ TRAIN_WINDOW_DAYS = 5
 TRADE_WINDOW_HOURS = (9, 17)  # 9am to 5pm EST
 TOP_N_TOKENS = 5
 SLIDE_STEP_DAYS = 1
-TRADING_DAYS = 10
 
 # Model hyperparameters
 NODE_EMBED_DIM = 64
@@ -69,8 +69,6 @@ DEVICE = (
     else "cpu"
 )
 
-EPOCHS = 75
-
 logger.info(
     "Device: %s | Train window: %d days | Trade hours: %d-%d EST",
     DEVICE,
@@ -85,62 +83,98 @@ with TOKENS_PATH.open() as f:
     tokens_metadata: dict[str, dict[str, Any]] = json.load(f)
 
 # %%
-# Load and prepare data
-logger.info("Loading labeled bars from %s", DATA_PATH)
-df = pl.read_parquet(DATA_PATH)
-logger.info("Bars loaded: %s", f"{df.shape[0]:,}")
+def load_bars(data_path: Path) -> pl.DataFrame:
+    """Load and prepare swap bar data.
 
-# Ensure data is sorted by time and token IDs to break ties consistently
-df = df.sort(["bar_close_timestamp", "src_token_id", "dest_token_id"])
+    Args:
+        data_path: Path to the parquet file with labeled bars.
 
-# Filter out rows where dest_fracdiff is null
-df = df.filter(pl.col("dest_fracdiff").is_not_null())
-logger.info("After filtering null dest_fracdiff: %s", f"{df.shape[0]:,}")
+    Returns:
+        Cleaned and sorted DataFrame with swap bars.
 
-# Filter out rows with NaN in edge features and labels
-edge_cols = [
-    "src_fracdiff",
-    "dest_fracdiff",
-    "src_flow_usdc",
-    "dest_flow_usdc",
-    "tick_count",
-    "rolling_volatility",
-    "bar_time_delta_sec",
-    "label",
-    "sample_weight",
-]
-for col in edge_cols:
-    df = df.filter(pl.col(col).is_not_null())
-    # Also filter NaNs for float columns
-    if df.schema[col] in (pl.Float32, pl.Float64):
-        df = df.filter(pl.col(col).is_finite())
+    """
+    logger.info("Loading labeled bars from %s", data_path)
+    df = pl.read_parquet(data_path)
+    logger.info("Bars loaded: %s", f"{df.shape[0]:,}")
+
+    # Ensure data is sorted by time and token IDs to break ties consistently
+    df = df.sort(["bar_close_timestamp", "src_token_id", "dest_token_id"])
+
+    # Filter out rows with NaN in edge features and labels
+    edge_cols = [
+        "src_fracdiff",
+        "dest_fracdiff",
+        "src_flow_usdc",
+        "dest_flow_usdc",
+        "tick_count",
+        "rolling_volatility",
+        "bar_time_delta_sec",
+        "label",
+        "sample_weight",
+    ]
+    for col in edge_cols:
+        df = df.filter(pl.col(col).is_not_null())
+        # Also filter NaNs for float columns
+        if df.schema[col] in (pl.Float32, pl.Float64):
+            df = df.filter(pl.col(col).is_finite())
+    logger.info("After filtering null edge features: %s", f"{df.shape[0]:,}")
+
+    return df
 
 
 # %%
-# Encode token IDs (0-indexed for TGM)
-logger.info("Encoding token IDs")
-le = LabelEncoder()
-all_tokens = np.concatenate(
-    [
-        df["src_token_id"].to_numpy(),
-        df["dest_token_id"].to_numpy(),
-    ],
-)
-le.fit(all_tokens)
-num_tokens = len(le.classes_)
-logger.info("Unique tokens: %s", f"{num_tokens:,}")
+def prepare_data(
+    df: pl.DataFrame,
+) -> tuple[pl.DataFrame, LabelEncoder, int, pl.DataFrame]:
+    """Encode token IDs and create date index.
 
-# Create date index for windowing
-df = df.with_columns(
-    pl.col("bar_close_timestamp").dt.date().alias("trade_date"),
-)
-unique_dates = df.select("trade_date").unique().sort("trade_date")
-logger.info(
-    "Date range: %s to %s | Total days: %d",
-    unique_dates["trade_date"][0],
-    unique_dates["trade_date"][-1],
-    len(unique_dates),
-)
+    Args:
+        df: DataFrame with swap bars (already sorted).
+
+    Returns:
+        Tuple of (df with trade_date, label encoder, num_tokens, unique_dates).
+
+    """
+    logger.info("Encoding token IDs")
+    le = LabelEncoder()
+    all_tokens = np.concatenate(
+        [
+            df["src_token_id"].to_numpy(),
+            df["dest_token_id"].to_numpy(),
+        ],
+    )
+    le.fit(all_tokens)
+    num_tokens = len(le.classes_)
+    logger.info("Unique tokens: %s", f"{num_tokens:,}")
+
+    # Create date index for windowing
+    df = df.with_columns(
+        pl.col("bar_close_timestamp").dt.date().alias("trade_date"),
+    )
+
+    # Add monotonic event index (since df is already sorted)
+    # This respects dollar bar "information time" ordering
+    df = df.with_columns(
+        pl.int_range(0, pl.len(), dtype=pl.Int64).alias("event_index"),
+    )
+
+    # Add encoded token IDs (avoid re-computing in build_window)
+    src_encoded = le.transform(df["src_token_id"].to_numpy())
+    dest_encoded = le.transform(df["dest_token_id"].to_numpy())
+    df = df.with_columns([
+        pl.Series("src_token_encoded", src_encoded, dtype=pl.Int32),
+        pl.Series("dest_token_encoded", dest_encoded, dtype=pl.Int32),
+    ])
+
+    unique_dates = df.select("trade_date").unique().sort("trade_date")
+    logger.info(
+        "Date range: %s to %s | Total days: %d",
+        unique_dates["trade_date"][0],
+        unique_dates["trade_date"][-1],
+        len(unique_dates),
+    )
+
+    return df, le, num_tokens, unique_dates
 
 
 # %%
@@ -220,32 +254,23 @@ class TokenPredictorModel(nn.Module):
 
 
 # %%
-def build_window(
-    df_window: pl.DataFrame,
-    le: LabelEncoder,
-) -> DGData:
+def build_window(df_window: pl.DataFrame) -> DGData:
     """Build a window of swap bars.
 
     Args:
-        df_window: DataFrame with swap bars for training window.
-        le: LabelEncoder for token IDs.
+        df_window: DataFrame with swap bars (already sorted with event_index
+            and encoded tokens).
 
     Returns:
         DGData object with labels and sample_weights packed in dynamic_node_feats.
 
     """
-    src = np.asarray(le.transform(df_window["src_token_id"].to_numpy()), dtype=np.int32)
-    dst = np.asarray(
-        le.transform(df_window["dest_token_id"].to_numpy()),
-        dtype=np.int32,
-    )
+    # Use pre-computed encoded token IDs (already Int32 from prepare_data)
+    src = df_window["src_token_encoded"].to_numpy()
+    dst = df_window["dest_token_encoded"].to_numpy()
 
-    # Use event index as timestamp to respect dollar bar "information time"
-    # Using int64 (PyTorch standard) and monotonic sequence.
-    timestamps_sec = np.arange(len(df_window), dtype=np.int64)
-    # Note: timestamps_sec is strictly sorted by construction. 
-    # If DGData warns about sorting, it may be an internal check handling equal timestamps conservatively.
-    logger.debug("Timestamps min/max: %d/%d", timestamps_sec[0], timestamps_sec[-1])
+    # Use pre-computed event_index as timestamps (already Int64 from prepare_data)
+    timestamps = df_window["event_index"].to_numpy()
 
     edge_feats = (
         df_window.select(
@@ -264,9 +289,6 @@ def build_window(
     )
     assert not np.isnan(edge_feats).any(), "NaN values found in edge features"
 
-    node_timestamps = timestamps_sec
-    node_ids = src
-
     # Pack labels and weights into dynamic_node_feats
     labels = (df_window["label"].fill_null(0).to_numpy().astype(np.int64) + 1).astype(
         np.float32,
@@ -275,11 +297,11 @@ def build_window(
     dynamic_node_feats = np.stack((labels, weights), axis=-1)
 
     g = DGData.from_raw(
-        edge_timestamps=torch.from_numpy(timestamps_sec),
+        edge_timestamps=torch.from_numpy(timestamps),
         edge_index=torch.from_numpy(np.column_stack((src, dst))),
         edge_feats=torch.from_numpy(edge_feats),
-        node_timestamps=torch.from_numpy(node_timestamps),
-        node_ids=torch.from_numpy(node_ids),
+        node_timestamps=torch.from_numpy(timestamps),
+        node_ids=torch.from_numpy(src),
         dynamic_node_feats=torch.from_numpy(dynamic_node_feats),
         time_delta="s",
     )
@@ -566,8 +588,25 @@ def compute_backtest_summary(results: list[dict]) -> None:
     logger.info("=" * 80)
 
 
-def backtest_slide() -> None:
-    """Run sliding backtest: train 5 days, trade 5 days, slide 1 day."""
+def backtest_slide(
+    df: pl.DataFrame,
+    le: LabelEncoder,
+    num_tokens: int,
+    unique_dates: pl.DataFrame,
+    epochs: int,
+    trading_days: int,
+) -> None:
+    """Run sliding backtest: train 5 days, trade 5 days, slide 1 day.
+
+    Args:
+        df: DataFrame with swap bars and trade_date column.
+        le: LabelEncoder for token IDs.
+        num_tokens: Total number of unique tokens.
+        unique_dates: DataFrame with unique trade dates.
+        epochs: Number of training epochs.
+        trading_days: Number of days to trade after each training window.
+
+    """
     logger.info("=" * 80)
     logger.info("SLIDING BACKTEST")
     logger.info("=" * 80)
@@ -583,7 +622,7 @@ def backtest_slide() -> None:
     # Extract unique dates for sliding windows
     dates_array = unique_dates["trade_date"].to_list()
 
-    # Sliding window: train on 5 days, then trade for next TRADING_DAYS days
+    # Sliding window: train on 5 days, then trade for next trading_days days
     results: list[dict[str, Any]] = []
 
     for i in range(1):
@@ -598,18 +637,18 @@ def backtest_slide() -> None:
         )
         logger.info("Training events: %s", f"{len(df_train):,}")
 
-        data_train = build_window(df_train, le)
+        data_train = build_window(df_train)
 
         # Train model - node embeddings updated via backprop
         train_model(
             model,
             data_train,
             DEVICE,
-            epochs=EPOCHS,
+            epochs=epochs,
         )
 
-        # Trade for next TRADING_DAYS days
-        for trade_offset in range(TRADING_DAYS):
+        # Trade for next trading_days days
+        for trade_offset in range(trading_days):
             if i + TRAIN_WINDOW_DAYS + trade_offset >= len(dates_array):
                 break
 
@@ -643,7 +682,7 @@ def backtest_slide() -> None:
                 logger.warning("No morning data for %s, skipping", trade_date)
                 continue
 
-            data_pred = build_window(df_morning, le)
+            data_pred = build_window(df_morning)
             top_tokens = predict_top_tokens(
                 model,
                 data_pred,
@@ -689,5 +728,28 @@ def backtest_slide() -> None:
     compute_backtest_summary(results)
 
 
+@click.command()
+@click.option(
+    "--epochs",
+    default=10,
+    type=int,
+    help="Number of training epochs (default: 10)",
+)
+@click.option(
+    "--trading-days",
+    default=5,
+    type=int,
+    help="Number of days to trade after each training window (default: 5)",
+)
+def main(epochs: int, trading_days: int) -> None:
+    """Run sliding backtest for TGCN token price predictions on DEX swaps."""
+    # Load and prepare data
+    df = load_bars(DATA_PATH)
+    df, le, num_tokens, unique_dates = prepare_data(df)
+
+    # Run backtest
+    backtest_slide(df, le, num_tokens, unique_dates, epochs, trading_days)
+
+
 if __name__ == "__main__":
-    backtest_slide()
+    main()
