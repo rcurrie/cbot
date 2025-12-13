@@ -6,12 +6,15 @@ Machine Learning driven Crypto Trading System using Decentralized Exchange (DEX)
 
 NEVER DELETE A FILE WITHOUT EXPRESS PERMISSION FROM ME OR A DIRECT COMMAND FROM ME.
 
-# Python Standards
+## CRITICAL: Python Execution
 
-- Always use uv to run python, ruff and other tools
+**NEVER use `python` directly. ALWAYS use `uv run python` for ALL Python execution.**
+
+- Use `uv run python script.py` instead of `python script.py`
+- Use `uv run pytest` instead of `pytest`
+- Use `uv run ruff` instead of `ruff`
+- For interactive Python: `uv run python`
 - Only use uv, NEVER pip, to manage packages
-- Virtual env managed by uv in .venv which you can assume is activated
-- Python 3.14 and higher (NOT pip/poetry/conda!)
 - Line lenghts should be limited to 88
 
 # Coding Philosophy

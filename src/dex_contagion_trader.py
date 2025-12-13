@@ -1,22 +1,23 @@
-"""Sliding backtest for TGCN token price predictions on DEX swaps.
+"""Daily sliding backtest for TGCN token price predictions on DEX swaps.
 
-Architecture:
-- Train on 5 days of events (up to 9am EST)
-- Predict top-5 tokens to go long (1-8 hours ahead)
-- Close positions at 5pm EST
-- Report daily returns
-- Slide forward 1 day and repeat
-- Retraining decision based on ADF stationarity test on predictions
+Daily Trading Cycle:
+1. Train on 5 days of data up to 9am on trade day
+2. Predict top 5 tokens to go long at 9am
+3. Trade from 9am to 5pm
+4. Calculate returns and close positions
+5. Slide forward 1 day and retrain from scratch
 
-Nodes: Tokens
-Edges: Swaps between tokens with temporal and flow information
-Node labels: Triple-barrier method outputs (up/down/stay predictions)
-Edge features: src_fracdiff, dest_fracdiff, flows, volatility, time
+TGCN Architecture:
+- Nodes: Tokens
+- Edges: Swaps between tokens with temporal and flow information
+- Node labels: Triple-barrier method outputs (up/down/stay predictions)
+- Edge features: src_fracdiff, dest_fracdiff, flows, volatility, time
 """
 
 # %%
 import json
 import logging
+from datetime import date
 from pathlib import Path
 from typing import Any
 
@@ -40,6 +41,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Number of '==' characters for logging
+DIVIDER_LENGTH = 40
+
 # Storage locations
 DATA_PATH = Path("data/labeled_log_fracdiff_price.parquet")
 TOKENS_PATH = Path("data/tokens.json")
@@ -52,6 +56,10 @@ TRAIN_WINDOW_DAYS = 5
 TRADE_WINDOW_HOURS = (9, 17)  # 9am to 5pm EST
 TOP_N_TOKENS = 5
 SLIDE_STEP_DAYS = 1
+
+# Risk management
+STOP_LOSS_PCT = 0.20  # Exit if position drops 20%
+TAKE_PROFIT_PCT = 2.0  # Exit if position gains 200%
 
 # Model hyperparameters
 NODE_EMBED_DIM = 64
@@ -82,9 +90,10 @@ logger.info(
 with TOKENS_PATH.open() as f:
     tokens_metadata: dict[str, dict[str, Any]] = json.load(f)
 
+
 # %%
-def load_bars(data_path: Path) -> pl.DataFrame:
-    """Load and prepare swap bar data.
+def load_and_filter_bars(data_path: Path) -> pl.DataFrame:
+    """Load and filter swap bar data.
 
     Args:
         data_path: Path to the parquet file with labeled bars.
@@ -161,10 +170,12 @@ def prepare_data(
     # Add encoded token IDs (avoid re-computing in build_window)
     src_encoded = le.transform(df["src_token_id"].to_numpy())
     dest_encoded = le.transform(df["dest_token_id"].to_numpy())
-    df = df.with_columns([
-        pl.Series("src_token_encoded", src_encoded, dtype=pl.Int32),
-        pl.Series("dest_token_encoded", dest_encoded, dtype=pl.Int32),
-    ])
+    df = df.with_columns(
+        [
+            pl.Series("src_token_encoded", src_encoded, dtype=pl.Int32),
+            pl.Series("dest_token_encoded", dest_encoded, dtype=pl.Int32),
+        ],
+    )
 
     unique_dates = df.select("trade_date").unique().sort("trade_date")
     logger.info(
@@ -253,24 +264,63 @@ class TokenPredictorModel(nn.Module):
         return None
 
 
-# %%
-def build_window(df_window: pl.DataFrame) -> DGData:
-    """Build a window of swap bars.
+def build_window(
+    df: pl.DataFrame,
+    start_date: date | None = None,
+    end_date: date | None = None,
+    start_hour: int | None = None,
+    end_hour: int | None = None,
+) -> DGData:
+    """Build a temporal window from the full DataFrame.
+
+    This function filters the DataFrame by date and hour ranges to create a window
+    of events, then constructs a DGData object for that window. Dollar bars are
+    volume-based events with variable timing, but we use calendar time for windowing
+    to support training on "N days" and predicting during specific hours.
 
     Args:
-        df_window: DataFrame with swap bars (already sorted with event_index
-            and encoded tokens).
+        df: Full DataFrame with all events (must have trade_date,
+            bar_close_timestamp, and pre-computed encoded tokens and event_index).
+        start_date: Start date for filtering (inclusive), or None for no limit.
+        end_date: End date for filtering (inclusive), or None for no limit.
+        start_hour: Start hour (0-23) for filtering (inclusive), or None.
+        end_hour: End hour (0-23) for filtering (exclusive), or None.
 
     Returns:
-        DGData object with labels and sample_weights packed in dynamic_node_feats.
+        DGData object for the filtered temporal window.
 
     """
+    df_window = df
+
+    # Filter by date range
+    if start_date is not None and end_date is not None:
+        df_window = df_window.filter(
+            (pl.col("trade_date") >= start_date) & (pl.col("trade_date") <= end_date),
+        )
+    elif start_date is not None:
+        df_window = df_window.filter(pl.col("trade_date") >= start_date)
+    elif end_date is not None:
+        df_window = df_window.filter(pl.col("trade_date") <= end_date)
+
+    # Filter by hour range (for intraday windowing)
+    if start_hour is not None:
+        df_window = df_window.filter(
+            pl.col("bar_close_timestamp").dt.hour() >= start_hour,
+        )
+    if end_hour is not None:
+        df_window = df_window.filter(
+            pl.col("bar_close_timestamp").dt.hour() < end_hour,
+        )
+
     # Use pre-computed encoded token IDs (already Int32 from prepare_data)
     src = df_window["src_token_encoded"].to_numpy()
     dst = df_window["dest_token_encoded"].to_numpy()
 
-    # Use pre-computed event_index as timestamps (already Int64 from prepare_data)
-    timestamps = df_window["event_index"].to_numpy()
+    # For each window, create local timestamps starting from 0
+    # This preserves relative timing within the window while making each window
+    # independent. Note: event_index maintains global ordering, but we renumber
+    # for local window time
+    timestamps = np.arange(len(df_window), dtype=np.int64)
 
     edge_feats = (
         df_window.select(
@@ -296,7 +346,7 @@ def build_window(df_window: pl.DataFrame) -> DGData:
     weights = df_window["sample_weight"].to_numpy().astype(np.float32)
     dynamic_node_feats = np.stack((labels, weights), axis=-1)
 
-    g = DGData.from_raw(
+    return DGData.from_raw(
         edge_timestamps=torch.from_numpy(timestamps),
         edge_index=torch.from_numpy(np.column_stack((src, dst))),
         edge_feats=torch.from_numpy(edge_feats),
@@ -305,7 +355,6 @@ def build_window(df_window: pl.DataFrame) -> DGData:
         dynamic_node_feats=torch.from_numpy(dynamic_node_feats),
         time_delta="s",
     )
-    return g
 
 
 # %%
@@ -436,17 +485,17 @@ def predict_top_tokens(
 def calculate_daily_returns(
     df_trade: pl.DataFrame,
     top_tokens: list[tuple[str, float]],
-    le: LabelEncoder,
 ) -> dict[str, float]:
-    """Calculate daily returns for predicted tokens.
+    """Calculate daily returns for predicted tokens with stop loss and take profit.
 
-    For each token predicted to go long, compute return as:
-    (median_price_end - median_price_start) / median_price_start
+    For each token predicted to go long, simulate intraday position:
+    - Exit if price drops by STOP_LOSS_PCT
+    - Exit if price gains by TAKE_PROFIT_PCT
+    - Otherwise hold until 5pm
 
     Args:
         df_trade: DataFrame with swap events for the trade date.
         top_tokens: List of (token_address, bullish_score) tuples.
-        le: LabelEncoder for token ID conversion.
 
     Returns:
         Dict mapping token_address to daily_return (as decimal, e.g., 0.05 = 5%).
@@ -455,25 +504,17 @@ def calculate_daily_returns(
     returns: dict[str, float] = {}
 
     for token_addr, _ in top_tokens:
-        # Get encoded token ID
-        try:
-            token_id_encoded = le.transform([token_addr])[0]
-        except ValueError:
-            logger.warning("Token %s not in encoder", token_addr[:10])
-            returns[token_addr] = 0.0
-            continue
-
         # Find all swaps where this token is src_token (we go long when swapping it out)
         token_events = df_trade.filter(
             pl.col("src_token_id") == token_addr,
-        )
+        ).sort("bar_close_timestamp")
 
         if len(token_events) == 0:
             logger.debug("No events for token %s", token_addr[:10])
             returns[token_addr] = 0.0
             continue
 
-        # Get first and last prices during the day
+        # Get price series during the day
         prices = token_events.select("src_price_usdc").to_numpy().flatten()
         prices = prices[~np.isnan(prices)]
 
@@ -482,13 +523,35 @@ def calculate_daily_returns(
             continue
 
         start_price = prices[0]
-        end_price = prices[-1]
+        stop_loss_price = start_price * (1 - STOP_LOSS_PCT)
+        take_profit_price = start_price * (1 + TAKE_PROFIT_PCT)
 
-        if start_price > 0:
-            daily_return = (end_price - start_price) / start_price
-            returns[token_addr] = daily_return
-        else:
-            returns[token_addr] = 0.0
+        # Simulate intraday position with stop loss and take profit
+        position_closed = False
+        final_return = 0.0
+
+        for price in prices[1:]:
+            # Check if stop loss hit
+            if price <= stop_loss_price:
+                final_return = -STOP_LOSS_PCT
+                position_closed = True
+                break
+
+            # Check if take profit hit
+            if price >= take_profit_price:
+                final_return = TAKE_PROFIT_PCT
+                position_closed = True
+                break
+
+        # If neither limit hit, use end-of-day price
+        if not position_closed:
+            end_price = prices[-1]
+            if start_price > 0:
+                final_return = (end_price - start_price) / start_price
+            else:
+                final_return = 0.0
+
+        returns[token_addr] = final_return
 
     return returns
 
@@ -537,10 +600,13 @@ def compute_backtest_summary(results: list[dict]) -> None:
     losing_days = sum(1 for r in portfolio_returns if r < 0)
     win_rate = winning_days / len(portfolio_returns) if portfolio_returns else 0.0
 
-    # Max drawdown (simplified)
-    cumsum = np.cumsum(portfolio_returns)
-    running_max = np.maximum.accumulate(cumsum)
-    drawdown = (cumsum - running_max) / (running_max + 1e-8)
+    # Max drawdown calculation
+    # Convert returns to cumulative wealth (starting from 1.0)
+    cumulative_wealth = np.cumprod([1 + r for r in portfolio_returns])
+    running_max_wealth = np.maximum.accumulate(cumulative_wealth)
+
+    # Drawdown is the percentage decline from running peak
+    drawdown = (cumulative_wealth - running_max_wealth) / running_max_wealth
     max_drawdown = np.min(drawdown) if len(drawdown) > 0 else 0.0
 
     # Best/worst days
@@ -552,19 +618,19 @@ def compute_backtest_summary(results: list[dict]) -> None:
     worst_day_date = results[worst_day_idx]["trade_date"]
 
     logger.info("BACKTEST SUMMARY")
-    logger.info("=" * 80)
+    logger.info("=" * DIVIDER_LENGTH)
     logger.info("Total trading days: %d", len(results))
-    logger.info("=" * 80)
+    logger.info("=" * DIVIDER_LENGTH)
     logger.info("RETURNS SUMMARY")
-    logger.info("=" * 80)
+    logger.info("=" * DIVIDER_LENGTH)
     logger.info("Total Return: %+.2f%%", total_return * 100)
     logger.info("Cumulative Return: %+.2f%%", cumulative_return * 100)
     logger.info("Mean Daily Return: %+.2f%%", mean_return * 100)
     logger.info("Std Dev: %.2f%%", std_return * 100)
     logger.info("Sharpe Ratio (annualized): %.2f", sharpe_ratio)
-    logger.info("=" * 80)
+    logger.info("=" * DIVIDER_LENGTH)
     logger.info("WIN/LOSS STATISTICS")
-    logger.info("=" * 80)
+    logger.info("=" * DIVIDER_LENGTH)
     logger.info(
         "Winning Days: %d / %d (%.1f%%)",
         winning_days,
@@ -576,16 +642,16 @@ def compute_backtest_summary(results: list[dict]) -> None:
         "Break-even Days: %d",
         len(results) - winning_days - losing_days,
     )
-    logger.info("=" * 80)
+    logger.info("=" * DIVIDER_LENGTH)
     logger.info("DRAWDOWN ANALYSIS")
-    logger.info("=" * 80)
+    logger.info("=" * DIVIDER_LENGTH)
     logger.info("Max Drawdown: %.2f%%", max_drawdown * 100)
-    logger.info("=" * 80)
+    logger.info("=" * DIVIDER_LENGTH)
     logger.info("EXTREME DAYS")
-    logger.info("=" * 80)
+    logger.info("=" * DIVIDER_LENGTH)
     logger.info("Best Day: %s (%+.2f%%)", best_day_date, best_day_return * 100)
     logger.info("Worst Day: %s (%+.2f%%)", worst_day_date, worst_day_return * 100)
-    logger.info("=" * 80)
+    logger.info("=" * DIVIDER_LENGTH)
 
 
 def backtest_slide(
@@ -594,52 +660,102 @@ def backtest_slide(
     num_tokens: int,
     unique_dates: pl.DataFrame,
     epochs: int,
-    trading_days: int,
+    trading_days: int | None = None,
 ) -> None:
-    """Run sliding backtest: train 5 days, trade 5 days, slide 1 day.
+    """Run sliding backtest: daily retrain and trade.
+
+    Each day:
+    1. Train on 5 days of data up to 9am on trade day
+    2. Predict top 5 tokens at 9am
+    3. Trade from 9am to 5pm
+    4. Calculate returns
+    5. Slide forward 1 day and retrain from scratch
 
     Args:
         df: DataFrame with swap bars and trade_date column.
         le: LabelEncoder for token IDs.
         num_tokens: Total number of unique tokens.
         unique_dates: DataFrame with unique trade dates.
-        epochs: Number of training epochs.
-        trading_days: Number of days to trade after each training window.
+        epochs: Number of training epochs per day.
+        trading_days: Number of days to trade (None = all available days).
 
     """
-    logger.info("=" * 80)
-    logger.info("SLIDING BACKTEST")
-    logger.info("=" * 80)
-
-    # Initialize model (node embeddings are now part of the model)
-    model = TokenPredictorModel(
-        num_nodes=num_tokens,
-        node_embed_dim=NODE_EMBED_DIM,  # <-- Simplified: no separate static_feat_dim
-        output_dim=NUM_CLASSES,
-        device=DEVICE,
-    ).to(DEVICE)
+    logger.info("=" * DIVIDER_LENGTH)
+    logger.info("SLIDING BACKTEST - DAILY RETRAIN")
+    logger.info("=" * DIVIDER_LENGTH)
 
     # Extract unique dates for sliding windows
     dates_array = unique_dates["trade_date"].to_list()
 
-    # Sliding window: train on 5 days, then trade for next trading_days days
+    # Determine number of trading days
+    max_trading_days = len(dates_array) - TRAIN_WINDOW_DAYS
+    if trading_days is None:
+        trading_days = max_trading_days
+    else:
+        trading_days = min(trading_days, max_trading_days)
+
+    logger.info("Total available days: %d", len(dates_array))
+    logger.info("Training window: %d days", TRAIN_WINDOW_DAYS)
+    logger.info("Trading days: %d", trading_days)
+
+    # Results storage
     results: list[dict[str, Any]] = []
 
-    for i in range(1):
-        train_start_date = dates_array[i]
-        train_end_date = dates_array[i + TRAIN_WINDOW_DAYS - 1]
+    # Start from day 5 (need 5 days of training history)
+    # Trade for specified number of days
+    for day_idx in range(TRAIN_WINDOW_DAYS, TRAIN_WINDOW_DAYS + trading_days):
+        trade_date = dates_array[day_idx]
 
-        logger.info("Training window: %s to %s", train_start_date, train_end_date)
+        # Training window: 5 days before trade_date, up to 9am on trade_date
+        train_start_date = dates_array[day_idx - TRAIN_WINDOW_DAYS]
+        train_end_date = dates_array[day_idx - 1]  # Day before trade_date
 
-        df_train = df.filter(
+        logger.info("")
+        logger.info("=" * DIVIDER_LENGTH)
+        logger.info("Trade Day: %s", trade_date)
+        logger.info("=" * DIVIDER_LENGTH)
+        logger.info(
+            "Training on: %s to %s (full days)",
+            train_start_date,
+            train_end_date,
+        )
+        logger.info("Plus morning data on %s (up to 9am)", trade_date)
+
+        # Initialize fresh model for this day
+        model = TokenPredictorModel(
+            num_nodes=num_tokens,
+            node_embed_dim=NODE_EMBED_DIM,
+            output_dim=NUM_CLASSES,
+            device=DEVICE,
+        ).to(DEVICE)
+
+        # Count events for logging
+        df_train_history = df.filter(
             (pl.col("trade_date") >= train_start_date)
             & (pl.col("trade_date") <= train_end_date),
         )
-        logger.info("Training events: %s", f"{len(df_train):,}")
+        df_train_morning = df.filter(
+            (pl.col("trade_date") == trade_date)
+            & (pl.col("bar_close_timestamp").dt.hour() < TRADE_WINDOW_HOURS[0]),
+        )
 
-        data_train = build_window(df_train)
+        total_train_events = len(df_train_history) + len(df_train_morning)
+        logger.info(
+            "Training events: %s (history) + %s (morning) = %s total",
+            f"{len(df_train_history):,}",
+            f"{len(df_train_morning):,}",
+            f"{total_train_events:,}",
+        )
 
-        # Train model - node embeddings updated via backprop
+        # For training, we'll use the combined window
+        data_train = build_window(
+            df,
+            start_date=train_start_date,
+            end_date=trade_date,
+            end_hour=TRADE_WINDOW_HOURS[0],  # Up to 9am
+        )
+
+        # Train model from scratch
         train_model(
             model,
             data_train,
@@ -647,83 +763,60 @@ def backtest_slide(
             epochs=epochs,
         )
 
-        # Trade for next trading_days days
-        for trade_offset in range(trading_days):
-            if i + TRAIN_WINDOW_DAYS + trade_offset >= len(dates_array):
-                break
+        # Predict at 9am using all training data (including morning)
+        top_tokens = predict_top_tokens(
+            model,
+            data_train,  # Use same data we trained on for prediction
+            le,
+            DEVICE,
+            top_n=TOP_N_TOKENS,
+        )
 
-            trade_date = dates_array[i + TRAIN_WINDOW_DAYS + trade_offset]
-            df_day = df.filter(pl.col("trade_date") == trade_date)
+        logger.info("Top 5 tokens predicted at 9am:")
 
-            if len(df_day) == 0:
-                logger.warning("No data for trade date %s", trade_date)
-                continue
+        # Calculate returns during trading window (9am-5pm)
+        df_trading = df.filter(
+            (pl.col("trade_date") == trade_date)
+            & (pl.col("bar_close_timestamp").dt.hour() >= TRADE_WINDOW_HOURS[0])
+            & (pl.col("bar_close_timestamp").dt.hour() < TRADE_WINDOW_HOURS[1]),
+        )
 
-            # Split into prediction context (pre-9am) and trading window (9am-5pm)
-            trade_start_hour = TRADE_WINDOW_HOURS[0]
-            trade_end_hour = TRADE_WINDOW_HOURS[1]
+        logger.info("Trading window events (9am-5pm): %s", f"{len(df_trading):,}")
 
-            df_morning = df_day.filter(
-                pl.col("bar_close_timestamp").dt.hour() < trade_start_hour,
-            )
-            df_trading = df_day.filter(
-                (pl.col("bar_close_timestamp").dt.hour() >= trade_start_hour)
-                & (pl.col("bar_close_timestamp").dt.hour() < trade_end_hour),
-            )
+        if len(df_trading) == 0:
+            logger.warning("No trading data for %s, skipping", trade_date)
+            continue
 
+        # Calculate token returns with stop loss and take profit
+        token_returns = calculate_daily_returns(df_trading, top_tokens)
+
+        for rank, (token_addr, score) in enumerate(top_tokens, 1):
+            token_addr_lower = token_addr.lower()
+            token_meta = tokens_metadata.get(token_addr_lower, {})
+            symbol = token_meta.get("symbol", token_addr[:10])
+            daily_return = token_returns.get(token_addr, 0.0)
             logger.info(
-                "\nTrade date: %s | Morning events: %s | Trading events: %s",
-                trade_date,
-                f"{len(df_morning):,}",
-                f"{len(df_trading):,}",
+                "  %d. %s | Score: %.2f%% | Return: %+.2f%%",
+                rank,
+                symbol,
+                score * 100,
+                daily_return * 100,
             )
 
-            if len(df_morning) == 0:
-                logger.warning("No morning data for %s, skipping", trade_date)
-                continue
+        # Calculate equal-weighted portfolio return
+        portfolio_return = sum(token_returns.values()) / len(token_returns)
+        logger.info("Portfolio return: %+.2f%%", portfolio_return * 100)
 
-            data_pred = build_window(df_morning)
-            top_tokens = predict_top_tokens(
-                model,
-                data_pred,
-                le,
-                DEVICE,
-                top_n=TOP_N_TOKENS,
-            )
-
-            logger.info(
-                "Top 5 tokens for %s (based on pre-%d:00 data):",
-                trade_date,
-                trade_start_hour,
-            )
-
-            token_returns = calculate_daily_returns(df_trading, top_tokens, le)
-
-            for rank, (token_addr, score) in enumerate(top_tokens, 1):
-                token_addr_lower = token_addr.lower()
-                token_meta = tokens_metadata.get(token_addr_lower, {})
-                symbol = token_meta.get("symbol", token_addr[:10])
-                daily_return = token_returns.get(token_addr, 0.0)
-                logger.info(
-                    "  %d. %s | Score: %.2f%% | Return: %+.2f%%",
-                    rank,
-                    symbol,
-                    score * 100,
-                    daily_return * 100,
-                )
-
-            portfolio_return = np.mean(list(token_returns.values()))
-
-            results.append(
-                {
-                    "train_start": train_start_date,
-                    "train_end": train_end_date,
-                    "trade_date": trade_date,
-                    "top_tokens": top_tokens,
-                    "token_returns": token_returns,
-                    "portfolio_return": portfolio_return,
-                },
-            )
+        results.append(
+            {
+                "train_start": train_start_date,
+                "train_end": train_end_date,
+                "trade_date": trade_date,
+                "top_tokens": top_tokens,
+                "token_returns": token_returns,
+                "portfolio_return": portfolio_return,
+            },
+        )
 
     compute_backtest_summary(results)
 
@@ -733,18 +826,24 @@ def backtest_slide(
     "--epochs",
     default=10,
     type=int,
-    help="Number of training epochs (default: 10)",
+    help="Number of training epochs per day (default: 10)",
 )
 @click.option(
     "--trading-days",
-    default=5,
+    default=None,
     type=int,
-    help="Number of days to trade after each training window (default: 5)",
+    help="Number of days to trade (default: all available days)",
 )
-def main(epochs: int, trading_days: int) -> None:
-    """Run sliding backtest for TGCN token price predictions on DEX swaps."""
-    # Load and prepare data
-    df = load_bars(DATA_PATH)
+def main(epochs: int, trading_days: int | None) -> None:
+    """Run daily sliding backtest for TGCN token predictions.
+
+    Each day:
+    - Train on 5 days up to 9am
+    - Predict top 5 tokens at 9am
+    - Trade from 9am to 5pm
+    - Slide forward 1 day and retrain
+    """
+    df = load_and_filter_bars(DATA_PATH)
     df, le, num_tokens, unique_dates = prepare_data(df)
 
     # Run backtest

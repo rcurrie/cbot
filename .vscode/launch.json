@@ -9,7 +9,20 @@
             "console": "integratedTerminal"
         },
         {
-            "name": "Python Debugger: Current File Verbose",
+            "name": "dex_contagion_trader",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/src/dex_contagion_trader.py",
+            "console": "integratedTerminal",
+            "args": [
+                "--trading-days",
+                "3",
+                "--epochs",
+                "5"
+            ]
+        }
+        {
+            "name": "dex_contagion_trader",
             "type": "debugpy",
             "request": "launch",
             "program": "${file}",
