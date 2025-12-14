@@ -439,7 +439,8 @@ def train_model(
         total_loss = 0.0
         num_batches = 0
 
-        for batch in tqdm(loader, desc=f"Train Epoch {epoch + 1}", leave=False):
+        pbar = tqdm(loader, desc=f"Epoch {epoch + 1}/{epochs}", leave=False)
+        for batch in pbar:
             if batch.src.shape[0] == 0 or batch.node_ids is None:
                 continue
 
@@ -475,8 +476,9 @@ def train_model(
             total_loss += weighted_loss.item()
             num_batches += 1
 
-        avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
-        logger.info("Epoch %d/%d - Loss: %.4f", epoch + 1, epochs, avg_loss)
+            # Update progress bar with current average loss
+            avg_loss = total_loss / num_batches
+            pbar.set_postfix({"loss": f"{avg_loss:.4f}"})
 
 
 def predict_top_tokens(
