@@ -18,6 +18,7 @@ TGCN Architecture:
 # %%
 import json
 import logging
+import time
 from datetime import date
 from pathlib import Path
 from typing import Any
@@ -435,9 +436,15 @@ def train_model(
     optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
     criterion = nn.CrossEntropyLoss(reduction="none")
 
+    # Track overall training statistics
+    overall_start_time = time.time()
+    overall_first_loss = None
+    overall_final_loss = None
+
     for epoch in range(epochs):
         total_loss = 0.0
         num_batches = 0
+        epoch_first_loss = None
 
         pbar = tqdm(loader, desc=f"Epoch {epoch + 1}/{epochs}", leave=False)
         for batch in pbar:
@@ -476,9 +483,30 @@ def train_model(
             total_loss += weighted_loss.item()
             num_batches += 1
 
-            # Update progress bar with current average loss
-            avg_loss = total_loss / num_batches
-            pbar.set_postfix({"loss": f"{avg_loss:.4f}"})
+            # Track first loss across all epochs
+            if overall_first_loss is None:
+                overall_first_loss = weighted_loss.item()
+
+            # Track first loss for this epoch
+            if epoch_first_loss is None:
+                epoch_first_loss = weighted_loss.item()
+
+            # Update progress bar with current loss (inline)
+            current_loss = weighted_loss.item()
+            pbar.set_postfix({"loss": f"{current_loss:.4f}"})
+
+        # Track final loss after last epoch
+        if num_batches > 0:
+            overall_final_loss = total_loss / num_batches
+
+    # Print summary after all epochs complete
+    overall_time = time.time() - overall_start_time
+    start_loss = overall_first_loss if overall_first_loss is not None else 0.0
+    end_loss = overall_final_loss if overall_final_loss is not None else 0.0
+    print(
+        f"Training completed in {overall_time:.2f}s - "
+        f"Start loss: {start_loss:.4f}, End loss: {end_loss:.4f}",
+    )
 
 
 def predict_top_tokens(
