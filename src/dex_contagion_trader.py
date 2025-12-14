@@ -11,7 +11,8 @@ TGCN Architecture:
 - Nodes: Tokens
 - Edges: Swaps between tokens with temporal and flow information
 - Node labels: Triple-barrier method outputs (up/down/stay predictions)
-- Edge features: src_fracdiff, dest_fracdiff, flows, volatility, time
+- Node features (dynamic): fracdiff, volatility, flow (evolve with each swap)
+- Edge features: flow magnitude (importance weighting)
 """
 
 # %%
@@ -62,6 +63,8 @@ STOP_LOSS_PCT = 0.20  # Exit if position drops 20%
 TAKE_PROFIT_PCT = 2.0  # Exit if position gains 200%
 
 # Model hyperparameters
+DYNAMIC_NODE_FEAT_DIM = 5  # fracdiff, volatility, flow, label, weight
+NODE_INPUT_DIM = 3  # fracdiff, volatility, flow (first 3 of dynamic features)
 NODE_EMBED_DIM = 64
 HIDDEN_DIM = 64
 NUM_CLASSES = 3  # down (0), stay (1), up (2)
@@ -194,14 +197,17 @@ class TokenPredictorModel(nn.Module):
     """TGCN encoder + decoder for token price movement prediction.
 
     Architecture:
-    - Node embeddings: Learnable parameters initialized randomly, updated via backprop
-    - TGCN encoder: Refines embeddings using temporal swaps (unsupervised)
-    - Predictor: Maps refined embeddings to price predictions (supervised via labels)
+    - Node features: fracdiff, volatility, flow (from aggregated swap data)
+    - Feature projection: Linear layer to map features to embedding space
+    - Node embeddings: Learnable parameters combined with projected features
+    - TGCN encoder: Refines combined embeddings using temporal swaps
+    - Predictor: Maps refined embeddings to price predictions (supervised)
     """
 
     def __init__(
         self,
         num_nodes: int,
+        node_feat_dim: int,
         node_embed_dim: int,
         output_dim: int,
         device: str = "cpu",
@@ -210,7 +216,8 @@ class TokenPredictorModel(nn.Module):
 
         Args:
             num_nodes: Total number of tokens in graph.
-            node_embed_dim: Embedding dimension (used for node embeddings and TGCN).
+            node_feat_dim: Dimension of input node features (fracdiff, etc).
+            node_embed_dim: Embedding dimension (used for TGCN).
             output_dim: Number of output classes (3: down/stay/up).
             device: Device to place tensors on.
 
@@ -218,9 +225,17 @@ class TokenPredictorModel(nn.Module):
         super().__init__()
         self.num_nodes = num_nodes
         self.device = device
+        self.node_embed_dim = node_embed_dim
+
+        # Project node features to embedding space
+        self.feature_projection = nn.Linear(
+            node_feat_dim,
+            node_embed_dim,
+            device=device,
+        )
 
         # Learnable node embeddings - initialized randomly, updated via backprop
-        # Refined by TGCN via message passing on the swap graph
+        # These complement the projected features with learnable representations
         self.node_embeddings = nn.Parameter(
             torch.randn(num_nodes, node_embed_dim, device=device),
         )
@@ -245,21 +260,41 @@ class TokenPredictorModel(nn.Module):
         """Forward pass through encoder and predictor.
 
         Args:
-            batch: DGBatch with src, dst, edge_index, node_ids.
+            batch: DGBatch with dynamic_node_feats, edge_index, edge_feats.
 
         Returns:
             logits: [num_nodes_in_batch, output_dim] or None if no nodes.
 
         """
-        # TGCN takes self.node_embeddings as INPUT
-        # and outputs UPDATED embeddings based on graph structure + messages
-        z = self.tgcn(self.node_embeddings, batch.edge_index)
+        # Extract node features from dynamic_node_feats
+        # dynamic_node_feats[:, 0:3] = [fracdiff, volatility, flow]
+        # dynamic_node_feats[:, 3:5] = [label, weight] (used for training)
+        node_features = batch.dynamic_node_feats[:, :3]
 
-        if batch.node_ids is not None:
-            # Select embeddings for nodes that have labels
-            z_node = z[batch.node_ids]
-            # Predictor: predict price movement from refined embeddings
-            result: torch.Tensor = self.predictor(z_node)
+        # Project node features to embedding space
+        node_feats_projected = self.feature_projection(node_features)
+
+        # Combine projected features with learnable embeddings
+        # node_ids tells us which tokens are updated at each event
+        # We add the learnable embedding for each token
+        x_combined = node_feats_projected + self.node_embeddings[batch.node_ids]
+
+        # TGCN refines embeddings via message passing on swap graph
+        # Extract edge weights from edge_feats (single feature: flow magnitude)
+        edge_weight = (
+            batch.edge_feats.squeeze(-1)
+            if batch.edge_feats is not None
+            else None
+        )
+        z = self.tgcn(x_combined, batch.edge_index, edge_weight)
+
+        # For prediction, we only use nodes that have labels
+        # Labels are in dynamic_node_feats[:, 3]
+        # Filter for nodes with non-zero labels (src tokens)
+        has_label = batch.dynamic_node_feats[:, 3] > 0
+        if has_label.any():
+            z_labeled = z[has_label]
+            result: torch.Tensor = self.predictor(z_labeled)
             return result
         return None
 
@@ -277,6 +312,9 @@ def build_window(
     of events, then constructs a DGData object for that window. Dollar bars are
     volume-based events with variable timing, but we use calendar time for windowing
     to support training on "N days" and predicting during specific hours.
+
+    Each swap event creates TWO node updates (one for src, one for dest) with
+    dynamic features that evolve over time as swaps occur.
 
     Args:
         df: Full DataFrame with all events (must have trade_date,
@@ -315,43 +353,61 @@ def build_window(
     # Use pre-computed encoded token IDs (already Int32 from prepare_data)
     src = df_window["src_token_encoded"].to_numpy()
     dst = df_window["dest_token_encoded"].to_numpy()
+    num_events = len(df_window)
 
     # For each window, create local timestamps starting from 0
     # This preserves relative timing within the window while making each window
     # independent. Note: event_index maintains global ordering, but we renumber
     # for local window time
-    timestamps = np.arange(len(df_window), dtype=np.int64)
+    edge_timestamps = np.arange(num_events, dtype=np.int64)
 
-    edge_feats = (
-        df_window.select(
-            [
-                "src_fracdiff",
-                "dest_fracdiff",
-                "src_flow_usdc",
-                "dest_flow_usdc",
-                "tick_count",
-                "rolling_volatility",
-                "bar_time_delta_sec",
-            ],
-        )
-        .to_numpy()
-        .astype(np.float32)
-    )
-    assert not np.isnan(edge_feats).any(), "NaN values found in edge features"
+    # Extract features for each swap event
+    src_fracdiff = df_window["src_fracdiff"].to_numpy()
+    dest_fracdiff = df_window["dest_fracdiff"].to_numpy()
+    src_flow = df_window["src_flow_usdc"].to_numpy()
+    dest_flow = df_window["dest_flow_usdc"].to_numpy()
+    volatility = df_window["rolling_volatility"].to_numpy()
+    labels = df_window["label"].fill_null(0).to_numpy().astype(np.int64) + 1
+    weights = df_window["sample_weight"].to_numpy()
 
-    # Pack labels and weights into dynamic_node_feats
-    labels = (df_window["label"].fill_null(0).to_numpy().astype(np.int64) + 1).astype(
-        np.float32,
-    )
-    weights = df_window["sample_weight"].to_numpy().astype(np.float32)
-    dynamic_node_feats = np.stack((labels, weights), axis=-1)
+    # Each swap event updates TWO nodes: src and dest
+    # We create 2 node updates per edge event
+    node_timestamps = np.repeat(edge_timestamps, 2)  # [0,0, 1,1, 2,2, ...]
+    node_ids = np.empty(num_events * 2, dtype=np.int32)
+    node_ids[0::2] = src  # Even indices: src tokens
+    node_ids[1::2] = dst  # Odd indices: dest tokens
+
+    # Dynamic node features: [fracdiff, volatility, flow, label, weight]
+    # Shape: [num_events * 2, 5]
+    dynamic_node_feats = np.zeros((num_events * 2, 5), dtype=np.float32)
+
+    # Src node updates (even indices)
+    dynamic_node_feats[0::2, 0] = src_fracdiff   # fracdiff
+    dynamic_node_feats[0::2, 1] = volatility      # volatility
+    dynamic_node_feats[0::2, 2] = src_flow        # flow
+    dynamic_node_feats[0::2, 3] = labels          # label (only src has labels)
+    dynamic_node_feats[0::2, 4] = weights         # weight
+
+    # Dest node updates (odd indices)
+    dynamic_node_feats[1::2, 0] = dest_fracdiff   # fracdiff
+    dynamic_node_feats[1::2, 1] = volatility      # volatility
+    dynamic_node_feats[1::2, 2] = dest_flow       # flow
+    dynamic_node_feats[1::2, 3] = 0               # no label for dest (yet)
+    dynamic_node_feats[1::2, 4] = 0               # no weight for dest (yet)
+
+    # Handle NaN values in features (set to 0)
+    dynamic_node_feats = np.nan_to_num(dynamic_node_feats, nan=0.0)
+
+    # Edge features: use absolute flow magnitude (importance weighting)
+    # Shape: [num_events, 1] for single feature
+    edge_feats = np.abs(src_flow).astype(np.float32).reshape(-1, 1)
 
     return DGData.from_raw(
-        edge_timestamps=torch.from_numpy(timestamps),
+        edge_timestamps=torch.from_numpy(edge_timestamps),
         edge_index=torch.from_numpy(np.column_stack((src, dst))),
         edge_feats=torch.from_numpy(edge_feats),
-        node_timestamps=torch.from_numpy(timestamps),
-        node_ids=torch.from_numpy(src),
+        node_timestamps=torch.from_numpy(node_timestamps),
+        node_ids=torch.from_numpy(node_ids),
         dynamic_node_feats=torch.from_numpy(dynamic_node_feats),
         time_delta="s",
     )
@@ -393,6 +449,8 @@ def train_model(
             edge_index = torch.stack([batch.src, batch.dst], dim=0)
             batch.edge_index = edge_index
 
+            # Move features to device
+            batch.edge_feats = batch.edge_feats.to(device)
             batch.dynamic_node_feats = batch.dynamic_node_feats.to(device)
             batch.node_ids = batch.node_ids.to(device)
 
@@ -402,9 +460,11 @@ def train_model(
             if logits is None:
                 continue
 
-            # Unpack labels and weights from dynamic_node_feats
-            y_true = batch.dynamic_node_feats[:, 0].long()
-            batch_weights = batch.dynamic_node_feats[:, 1].float()
+            # Extract labels and weights from dynamic_node_feats
+            # Only use nodes with labels (src tokens, where label > 0)
+            has_label = batch.dynamic_node_feats[:, 3] > 0
+            y_true = batch.dynamic_node_feats[has_label, 3].long()
+            batch_weights = batch.dynamic_node_feats[has_label, 4].float()
 
             loss_per_node = criterion(logits, y_true)
             weighted_loss = (loss_per_node * batch_weights).mean()
@@ -456,17 +516,22 @@ def predict_top_tokens(
             edge_index = torch.stack([batch.src, batch.dst], dim=0)
             batch.edge_index = edge_index
 
+            # Move features to device
+            batch.edge_feats = batch.edge_feats.to(device)
             batch.dynamic_node_feats = batch.dynamic_node_feats.to(device)
             batch.node_ids = batch.node_ids.to(device)
 
-            logits = model(batch)  # <-- No longer pass node_embeddings
+            logits = model(batch)
             if logits is None:
                 continue
 
             preds = torch.argmax(logits, dim=1).cpu().numpy()
-            node_ids = batch.node_ids.cpu().numpy()
 
-            for node_id, pred in zip(node_ids, preds):
+            # Get node_ids for labeled nodes only (src tokens)
+            has_label = batch.dynamic_node_feats[:, 3] > 0
+            labeled_node_ids = batch.node_ids[has_label].cpu().numpy()
+
+            for node_id, pred in zip(labeled_node_ids, preds):
                 if node_id not in token_predictions:
                     token_predictions[node_id] = []
                 token_predictions[node_id].append(pred)
@@ -724,6 +789,7 @@ def backtest_slide(
         # Initialize fresh model for this day
         model = TokenPredictorModel(
             num_nodes=num_tokens,
+            node_feat_dim=NODE_INPUT_DIM,
             node_embed_dim=NODE_EMBED_DIM,
             output_dim=NUM_CLASSES,
             device=DEVICE,
