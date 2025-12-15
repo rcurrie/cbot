@@ -398,17 +398,18 @@ def build_window(
     dynamic_node_feats = np.nan_to_num(dynamic_node_feats, nan=0.0)
 
     # Edge features: use absolute flow magnitude (importance weighting)
-    # Shape: [num_events, 1] for single feature
-    edge_feats = np.abs(src_flow).astype(np.float32).reshape(-1, 1)
-
-    edge_index = np.column_stack((src, dst))
+    # Create bidirectional edges with direction-specific flow features
+    # Forward edge (src->dst) uses src_flow, reverse edge (dst->src) uses dest_flow
+    edge_feats_forward = np.abs(src_flow).astype(np.float32).reshape(-1, 1)
+    edge_feats_reverse = np.abs(dest_flow).astype(np.float32).reshape(-1, 1)
 
     # Bi-directional edge index: (src, dst) and (dst, src)
-    # Duplicate edge features/weights for reverse edges
     edges_forward = np.column_stack((src, dst))
     edges_reverse = np.column_stack((dst, src))
     edge_index = np.vstack([edges_forward, edges_reverse])
-    edge_feats = np.concatenate([edge_feats, edge_feats])
+
+    # Combine edge features with direction-specific flows
+    edge_feats = np.concatenate([edge_feats_forward, edge_feats_reverse])
     edge_timestamps = np.concatenate([edge_timestamps, edge_timestamps])
 
     return DGData.from_raw(
@@ -657,25 +658,6 @@ def calculate_daily_returns(
         returns[token_addr] = final_return
 
     return returns
-
-
-def should_retrain(
-    predictions: np.ndarray,
-    adf_threshold: float = 0.05,
-) -> bool:
-    """Check if predictions are stationary using ADF test.
-
-    Args:
-        predictions: Array of model predictions.
-        adf_threshold: P-value threshold for ADF test (default: 0.05).
-
-    Returns:
-        False (never retrain by default as per requirements).
-
-    """
-    # Stub: Always return False (no retraining) per requirements
-    # In future: compute ADF on predictions, retrain if p > threshold
-    return False
 
 
 def compute_backtest_summary(results: list[dict]) -> None:
