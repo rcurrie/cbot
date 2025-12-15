@@ -283,9 +283,7 @@ class TokenPredictorModel(nn.Module):
         # TGCN refines embeddings via message passing on swap graph
         # Extract edge weights from edge_feats (single feature: flow magnitude)
         edge_weight = (
-            batch.edge_feats.squeeze(-1)
-            if batch.edge_feats is not None
-            else None
+            batch.edge_feats.squeeze(-1) if batch.edge_feats is not None else None
         )
         z = self.tgcn(x_combined, batch.edge_index, edge_weight)
 
@@ -383,18 +381,18 @@ def build_window(
     dynamic_node_feats = np.zeros((num_events * 2, 5), dtype=np.float32)
 
     # Src node updates (even indices)
-    dynamic_node_feats[0::2, 0] = src_fracdiff   # fracdiff
-    dynamic_node_feats[0::2, 1] = volatility      # volatility
-    dynamic_node_feats[0::2, 2] = src_flow        # flow
-    dynamic_node_feats[0::2, 3] = labels          # label (only src has labels)
-    dynamic_node_feats[0::2, 4] = weights         # weight
+    dynamic_node_feats[0::2, 0] = src_fracdiff  # fracdiff
+    dynamic_node_feats[0::2, 1] = volatility  # volatility
+    dynamic_node_feats[0::2, 2] = src_flow  # flow
+    dynamic_node_feats[0::2, 3] = labels  # label (only src has labels)
+    dynamic_node_feats[0::2, 4] = weights  # weight
 
     # Dest node updates (odd indices)
-    dynamic_node_feats[1::2, 0] = dest_fracdiff   # fracdiff
-    dynamic_node_feats[1::2, 1] = volatility      # volatility
-    dynamic_node_feats[1::2, 2] = dest_flow       # flow
-    dynamic_node_feats[1::2, 3] = 0               # no label for dest (yet)
-    dynamic_node_feats[1::2, 4] = 0               # no weight for dest (yet)
+    dynamic_node_feats[1::2, 0] = dest_fracdiff  # fracdiff
+    dynamic_node_feats[1::2, 1] = volatility  # volatility
+    dynamic_node_feats[1::2, 2] = dest_flow  # flow
+    dynamic_node_feats[1::2, 3] = 0  # no label for dest (yet)
+    dynamic_node_feats[1::2, 4] = 0  # no weight for dest (yet)
 
     # Handle NaN values in features (set to 0)
     dynamic_node_feats = np.nan_to_num(dynamic_node_feats, nan=0.0)
@@ -403,9 +401,19 @@ def build_window(
     # Shape: [num_events, 1] for single feature
     edge_feats = np.abs(src_flow).astype(np.float32).reshape(-1, 1)
 
+    edge_index = np.column_stack((src, dst))
+
+    # Bi-directional edge index: (src, dst) and (dst, src)
+    # Duplicate edge features/weights for reverse edges
+    edges_forward = np.column_stack((src, dst))
+    edges_reverse = np.column_stack((dst, src))
+    edge_index = np.vstack([edges_forward, edges_reverse])
+    edge_feats = np.concatenate([edge_feats, edge_feats])
+    edge_timestamps = np.concatenate([edge_timestamps, edge_timestamps])
+
     return DGData.from_raw(
         edge_timestamps=torch.from_numpy(edge_timestamps),
-        edge_index=torch.from_numpy(np.column_stack((src, dst))),
+        edge_index=torch.from_numpy(edge_index),
         edge_feats=torch.from_numpy(edge_feats),
         node_timestamps=torch.from_numpy(node_timestamps),
         node_ids=torch.from_numpy(node_ids),
