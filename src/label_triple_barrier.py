@@ -287,6 +287,86 @@ def _log_output_statistics(result_df: pl.DataFrame, verbose: bool) -> None:
     logger.info("  Max: %.3f", result_df["sample_weight"].max())
 
 
+def _process_token_labels(
+    df: pl.DataFrame,
+    token_col: str,
+    fracdiff_col: str,
+    barrier_fraction: float,
+    volatility_window: int,
+    upper_multiple: float,
+    lower_multiple: float,
+) -> pl.DataFrame:
+    """Process labels for a specific token column (src or dest).
+
+    Args:
+        df: Input DataFrame.
+        token_col: Column name for token ID (src_token_id or dest_token_id).
+        fracdiff_col: Column name for fracdiff price (src_fracdiff or dest_fracdiff).
+        barrier_fraction: Fraction of daily volume for vertical barrier.
+        volatility_window: Rolling window for volatility calculation.
+        upper_multiple: Multiplier for upper barrier (take profit).
+        lower_multiple: Multiplier for lower barrier (stop loss).
+
+    Returns:
+        DataFrame with columns: [token_col, bar_close_timestamp, label, sample_weight, etc].
+
+    """
+    # Sort by token and timestamp
+    df_sorted = df.sort([token_col, "bar_close_timestamp"])
+
+    # Store results as list of dataframes
+    result_dfs = []
+
+    for token_tuple, token_group in df_sorted.group_by(token_col, maintain_order=True):
+        token_id = token_tuple[0]
+        token_df = token_group.sort("bar_close_timestamp")
+
+        # Calculate dynamic vertical barrier
+        vertical_bars = calculate_dynamic_vertical_barrier(
+            token_df["bar_close_timestamp"],
+            barrier_fraction=barrier_fraction,
+        )
+
+        # Get price series (stationary target)
+        prices = token_df[fracdiff_col].to_numpy()
+
+        # Check for invalid data
+        if len(prices) < volatility_window + vertical_bars:
+            continue
+
+        # Calculate rolling volatility
+        volatilities = calculate_rolling_volatility(prices, volatility_window)
+
+        # Apply triple-barrier method
+        labels, barrier_touch_bars = apply_triple_barrier(
+            prices,
+            volatilities,
+            upper_multiple,
+            lower_multiple,
+            vertical_bars,
+        )
+
+        # Calculate sample weights based on concurrency
+        sample_weights = calculate_sample_weights(barrier_touch_bars)
+
+        # Add computed columns to this token's dataframe
+        token_df = token_df.with_columns(
+            [
+                pl.Series("_label", labels),
+                pl.Series("_sample_weight", sample_weights),
+                pl.Series("_volatility", volatilities),
+                pl.Series("_barrier_touch_bars", barrier_touch_bars),
+            ],
+        )
+
+        result_dfs.append(token_df)
+
+    # Concatenate all results
+    if result_dfs:
+        return pl.concat(result_dfs)
+    return pl.DataFrame()
+
+
 def label_triple_barrier(
     input_file: Path,
     output_file: Path,
@@ -311,9 +391,10 @@ def label_triple_barrier(
     logger.info("Loading data from %s...", input_file)
     df = pl.read_parquet(input_file)
     logger.info(
-        "Loaded %s messages for %d tokens",
+        "Loaded %s messages for %d unique src tokens, %d unique dest tokens",
         f"{len(df):,}",
         df["src_token_id"].n_unique(),
+        df["dest_token_id"].n_unique(),
     )
 
     logger.info("\nTriple-Barrier Parameters:")
@@ -322,96 +403,159 @@ def label_triple_barrier(
     logger.info("  Barrier fraction (daily vol): %.2f", barrier_fraction)
     logger.info("  Volatility window: %d", volatility_window)
 
-    # Sort by src_token_id and timestamp
-    df = df.sort(["src_token_id", "bar_close_timestamp"])
+    # Process src tokens to generate labels
+    logger.info("\nProcessing SRC tokens to generate labels...")
+    src_labels_df = _process_token_labels(
+        df,
+        "src_token_id",
+        "src_fracdiff",
+        barrier_fraction,
+        volatility_window,
+        upper_multiple,
+        lower_multiple,
+    )
+    if len(src_labels_df) > 0:
+        logger.info("  Processed %d src tokens", src_labels_df["src_token_id"].n_unique())
+    else:
+        logger.warning("  No src tokens processed")
 
-    # Process each token group
-    logger.info("\nProcessing tokens to generate labels...")
-    all_labeled_rows = []
+    # Process dest tokens to generate labels
+    logger.info("Processing DEST tokens to generate labels...")
+    dest_labels_df = _process_token_labels(
+        df,
+        "dest_token_id",
+        "dest_fracdiff",
+        barrier_fraction,
+        volatility_window,
+        upper_multiple,
+        lower_multiple,
+    )
+    if len(dest_labels_df) > 0:
+        logger.info("  Processed %d dest tokens", dest_labels_df["dest_token_id"].n_unique())
+    else:
+        logger.warning("  No dest tokens processed")
+
+    # Now assign labels back to the original dataframe
+    logger.info("\nAssigning labels to swap events...")
+
+    # Join src labels
+    if len(src_labels_df) > 0:
+        # Select only the columns we need for joining
+        src_join = src_labels_df.select([
+            "src_token_id",
+            "bar_close_timestamp",
+            pl.col("_label").alias("label"),
+            pl.col("_sample_weight").alias("sample_weight"),
+            pl.col("_volatility").alias("rolling_volatility"),
+            pl.col("_barrier_touch_bars").alias("barrier_touch_bars"),
+        ])
+        result_df = df.join(
+            src_join,
+            on=["src_token_id", "bar_close_timestamp"],
+            how="left",
+        )
+    else:
+        result_df = df.with_columns([
+            pl.lit(np.nan).alias("label"),
+            pl.lit(np.nan).alias("sample_weight"),
+            pl.lit(np.nan).alias("rolling_volatility"),
+            pl.lit(np.nan).alias("barrier_touch_bars"),
+        ])
+
+    # Join dest labels
+    if len(dest_labels_df) > 0:
+        dest_join = dest_labels_df.select([
+            "dest_token_id",
+            "bar_close_timestamp",
+            pl.col("_label").alias("dest_label"),
+            pl.col("_sample_weight").alias("dest_sample_weight"),
+            pl.col("_barrier_touch_bars").alias("dest_barrier_touch_bars"),
+        ])
+        result_df = result_df.join(
+            dest_join,
+            on=["dest_token_id", "bar_close_timestamp"],
+            how="left",
+        )
+    else:
+        result_df = result_df.with_columns([
+            pl.lit(np.nan).alias("dest_label"),
+            pl.lit(np.nan).alias("dest_sample_weight"),
+            pl.lit(np.nan).alias("dest_barrier_touch_bars"),
+        ])
+
+    # Gather token statistics from both src and dest
+    logger.info("\nGathering statistics...")
     token_stats = []
 
-    for token_tuple, token_group in df.group_by("src_token_id", maintain_order=True):
-        token_id = token_tuple[0]
-        token_df = token_group.sort("bar_close_timestamp")
-
-        # Calculate dynamic vertical barrier
-        vertical_bars = calculate_dynamic_vertical_barrier(
-            token_df["bar_close_timestamp"],
-            barrier_fraction=barrier_fraction,
+    # Get stats from src labels
+    if len(src_labels_df) > 0:
+        src_stats = (
+            src_labels_df
+            .filter(pl.col("_label").is_not_nan())
+            .group_by("src_token_id")
+            .agg([
+                pl.len().alias("n_total"),
+                (pl.col("_label") == 1).sum().alias("n_positive"),
+                (pl.col("_label") == -1).sum().alias("n_negative"),
+                (pl.col("_label") == 0).sum().alias("n_neutral"),
+                pl.col("_sample_weight").mean().alias("mean_sample_weight"),
+            ])
         )
+        for row in src_stats.iter_rows(named=True):
+            token_stats.append({
+                "token_id": row["src_token_id"],
+                "n_total": row["n_total"],
+                "n_valid_labels": row["n_total"],
+                "n_positive": row["n_positive"],
+                "n_negative": row["n_negative"],
+                "n_neutral": row["n_neutral"],
+                "mean_sample_weight": row["mean_sample_weight"],
+            })
 
-        # Get price series (stationary target)
-        prices = token_df["src_fracdiff"].to_numpy()
-
-        # Check for invalid data
-        if len(prices) < volatility_window + vertical_bars:
-            logger.warning(
-                "Token %s has insufficient data (%d bars) for barrier %d, skipping",
-                token_id[:10] + "...",
-                len(prices),
-                vertical_bars,
-            )
-            continue
-
-        # Calculate rolling volatility
-        volatilities = calculate_rolling_volatility(prices, volatility_window)
-
-        # Apply triple-barrier method
-        labels, barrier_touch_bars = apply_triple_barrier(
-            prices,
-            volatilities,
-            upper_multiple,
-            lower_multiple,
-            vertical_bars,
+    # Add stats from dest labels (combine with existing src stats if token appears in both)
+    if len(dest_labels_df) > 0:
+        dest_stats = (
+            dest_labels_df
+            .filter(pl.col("_label").is_not_nan())
+            .group_by("dest_token_id")
+            .agg([
+                pl.len().alias("n_total"),
+                (pl.col("_label") == 1).sum().alias("n_positive"),
+                (pl.col("_label") == -1).sum().alias("n_negative"),
+                (pl.col("_label") == 0).sum().alias("n_neutral"),
+                pl.col("_sample_weight").mean().alias("mean_sample_weight"),
+            ])
         )
+        # Merge with existing stats or add new ones
+        token_dict = {s["token_id"]: s for s in token_stats}
+        for row in dest_stats.iter_rows(named=True):
+            token_id = row["dest_token_id"]
+            if token_id in token_dict:
+                # Combine stats
+                existing = token_dict[token_id]
+                existing["n_total"] += row["n_total"]
+                existing["n_valid_labels"] += row["n_total"]
+                existing["n_positive"] += row["n_positive"]
+                existing["n_negative"] += row["n_negative"]
+                existing["n_neutral"] += row["n_neutral"]
+                # Average the weights
+                existing["mean_sample_weight"] = (
+                    existing["mean_sample_weight"] + row["mean_sample_weight"]
+                ) / 2
+            else:
+                token_dict[token_id] = {
+                    "token_id": token_id,
+                    "n_total": row["n_total"],
+                    "n_valid_labels": row["n_total"],
+                    "n_positive": row["n_positive"],
+                    "n_negative": row["n_negative"],
+                    "n_neutral": row["n_neutral"],
+                    "mean_sample_weight": row["mean_sample_weight"],
+                }
+        token_stats = list(token_dict.values())
 
-        # Calculate sample weights based on concurrency
-        sample_weights = calculate_sample_weights(barrier_touch_bars)
-
-        # Count valid labels
-        valid_mask = ~np.isnan(labels)
-        n_valid = np.sum(valid_mask)
-
-        if n_valid == 0:
-            logger.warning(
-                "Token %s produced no valid labels, skipping",
-                token_id[:10] + "...",
-            )
-            continue
-
-        # Count label distribution
-        n_positive = np.sum(labels[valid_mask] == 1)
-        n_negative = np.sum(labels[valid_mask] == -1)
-        n_neutral = np.sum(labels[valid_mask] == 0)
-
-        # Store statistics
-        token_stats.append(
-            {
-                "token_id": token_id,
-                "n_total": len(prices),
-                "n_valid_labels": n_valid,
-                "n_positive": n_positive,
-                "n_negative": n_negative,
-                "n_neutral": n_neutral,
-                "mean_sample_weight": np.nanmean(sample_weights[valid_mask]),
-            },
-        )
-
-        # Add new columns to token_df
-        all_labeled_rows.append(
-            token_df.with_columns(
-                [
-                    pl.Series("rolling_volatility", volatilities),
-                    pl.Series("label", labels),
-                    pl.Series("barrier_touch_bars", barrier_touch_bars),
-                    pl.Series("sample_weight", sample_weights),
-                ],
-            ),
-        )
-
-    # Combine all token dataframes
-    logger.info("\nCombining results from all tokens...")
-    result_df = pl.concat(all_labeled_rows)
+    # Filtering rows with valid labels
+    logger.info("\nFiltering rows with valid labels...")
 
     # Drop rows with NaN labels
     n_before = len(result_df)
@@ -473,6 +617,9 @@ def validate_output(output_file: Path, verbose: bool = False) -> None:
         "sample_weight",
         "rolling_volatility",
         "barrier_touch_bars",
+        "dest_label",
+        "dest_sample_weight",
+        "dest_barrier_touch_bars",
     }
     missing_columns = required_columns - set(df.columns)
     if missing_columns:

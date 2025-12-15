@@ -114,6 +114,7 @@ def load_and_filter_bars(data_path: Path) -> pl.DataFrame:
     df = df.sort(["bar_close_timestamp", "src_token_id", "dest_token_id"])
 
     # Filter out rows with NaN in edge features and labels
+    # Note: We keep rows if EITHER src or dest has a valid label
     edge_cols = [
         "src_fracdiff",
         "dest_fracdiff",
@@ -122,15 +123,28 @@ def load_and_filter_bars(data_path: Path) -> pl.DataFrame:
         "tick_count",
         "rolling_volatility",
         "bar_time_delta_sec",
-        "label",
-        "sample_weight",
     ]
+    # For labels, we'll filter later - keep rows with at least one valid label
     for col in edge_cols:
         df = df.filter(pl.col(col).is_not_null())
         # Also filter NaNs for float columns
         if df.schema[col] in (pl.Float32, pl.Float64):
             df = df.filter(pl.col(col).is_finite())
     logger.info("After filtering null edge features: %s", f"{df.shape[0]:,}")
+
+    # Keep rows where at least ONE of src_label or dest_label is valid
+    # This maximizes our training signal (Issue 3 fix)
+    n_before = df.shape[0]
+    df = df.filter(
+        (pl.col("label").is_not_null() & pl.col("label").is_finite())
+        | (pl.col("dest_label").is_not_null() & pl.col("dest_label").is_finite()),
+    )
+    n_after = df.shape[0]
+    logger.info(
+        "After filtering for at least one valid label: %s (kept %d rows)",
+        f"{n_after:,}",
+        n_after - n_before,
+    )
 
     return df
 
@@ -366,13 +380,21 @@ def build_window(
     src_flow = df_window["src_flow_usdc"].to_numpy()
     dest_flow = df_window["dest_flow_usdc"].to_numpy()
     volatility = df_window["rolling_volatility"].to_numpy()
+
     # Binary classification: merge stay into up (0 or 1 -> 1 for up, -1 -> 0 for down)
     # Original labels: -1=down, 0=stay, 1=up
     # New binary labels: 0=down (no invest), 1=up (consider invest)
     # Fill null with -999 to mark unlabeled nodes
-    raw_labels = df_window["label"].fill_null(-999).to_numpy().astype(np.int64)
-    labels = np.where(raw_labels == -999, -999, np.where(raw_labels >= 0, 1, 0))
-    weights = df_window["sample_weight"].to_numpy()
+
+    # Src token labels
+    raw_src_labels = df_window["label"].fill_null(-999).to_numpy().astype(np.int64)
+    src_labels = np.where(raw_src_labels == -999, -999, np.where(raw_src_labels >= 0, 1, 0))
+    src_weights = df_window["sample_weight"].to_numpy()
+
+    # Dest token labels (NEW: Issue 3 fix)
+    raw_dest_labels = df_window["dest_label"].fill_null(-999).to_numpy().astype(np.int64)
+    dest_labels = np.where(raw_dest_labels == -999, -999, np.where(raw_dest_labels >= 0, 1, 0))
+    dest_weights = df_window["dest_sample_weight"].to_numpy()
 
     # Each swap event updates TWO nodes: src and dest
     # We create 2 node updates per edge event
@@ -389,15 +411,15 @@ def build_window(
     dynamic_node_feats[0::2, 0] = src_fracdiff  # fracdiff
     dynamic_node_feats[0::2, 1] = volatility  # volatility
     dynamic_node_feats[0::2, 2] = src_flow  # flow
-    dynamic_node_feats[0::2, 3] = labels  # label (only src has labels)
-    dynamic_node_feats[0::2, 4] = weights  # weight
+    dynamic_node_feats[0::2, 3] = src_labels  # label
+    dynamic_node_feats[0::2, 4] = src_weights  # weight
 
-    # Dest node updates (odd indices)
+    # Dest node updates (odd indices) - NOW WITH LABELS (Issue 3 fix)
     dynamic_node_feats[1::2, 0] = dest_fracdiff  # fracdiff
     dynamic_node_feats[1::2, 1] = volatility  # volatility
     dynamic_node_feats[1::2, 2] = dest_flow  # flow
-    dynamic_node_feats[1::2, 3] = -999  # no label for dest (marker for unlabeled)
-    dynamic_node_feats[1::2, 4] = 0  # no weight for dest (yet)
+    dynamic_node_feats[1::2, 3] = dest_labels  # label (dest tokens now labeled!)
+    dynamic_node_feats[1::2, 4] = dest_weights  # weight (dest tokens now weighted!)
 
     # Handle NaN values in features (set to 0)
     dynamic_node_feats = np.nan_to_num(dynamic_node_feats, nan=0.0)
