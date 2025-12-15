@@ -68,8 +68,8 @@ DYNAMIC_NODE_FEAT_DIM = 5  # fracdiff, volatility, flow, label, weight
 NODE_INPUT_DIM = 3  # fracdiff, volatility, flow (first 3 of dynamic features)
 NODE_EMBED_DIM = 64
 HIDDEN_DIM = 64
-NUM_CLASSES = 3  # down (0), stay (1), up (2)
-LABEL_UP = 2
+NUM_CLASSES = 2  # Binary classification: down (0), up (1)
+LABEL_UP = 1
 BATCH_SIZE = 100
 BATCH_UNIT = "s"  # Batch by 100 seconds (which are events in our case)
 LEARNING_RATE = 1e-3
@@ -289,8 +289,8 @@ class TokenPredictorModel(nn.Module):
 
         # For prediction, we only use nodes that have labels
         # Labels are in dynamic_node_feats[:, 3]
-        # Filter for nodes with non-zero labels (src tokens)
-        has_label = batch.dynamic_node_feats[:, 3] > 0
+        # Filter for labeled nodes (exclude -999 marker for unlabeled dest tokens)
+        has_label = batch.dynamic_node_feats[:, 3] != -999
         if has_label.any():
             z_labeled = z[has_label]
             result: torch.Tensor = self.predictor(z_labeled)
@@ -366,7 +366,12 @@ def build_window(
     src_flow = df_window["src_flow_usdc"].to_numpy()
     dest_flow = df_window["dest_flow_usdc"].to_numpy()
     volatility = df_window["rolling_volatility"].to_numpy()
-    labels = df_window["label"].fill_null(0).to_numpy().astype(np.int64) + 1
+    # Binary classification: merge stay into up (0 or 1 -> 1 for up, -1 -> 0 for down)
+    # Original labels: -1=down, 0=stay, 1=up
+    # New binary labels: 0=down (no invest), 1=up (consider invest)
+    # Fill null with -999 to mark unlabeled nodes
+    raw_labels = df_window["label"].fill_null(-999).to_numpy().astype(np.int64)
+    labels = np.where(raw_labels == -999, -999, np.where(raw_labels >= 0, 1, 0))
     weights = df_window["sample_weight"].to_numpy()
 
     # Each swap event updates TWO nodes: src and dest
@@ -391,7 +396,7 @@ def build_window(
     dynamic_node_feats[1::2, 0] = dest_fracdiff  # fracdiff
     dynamic_node_feats[1::2, 1] = volatility  # volatility
     dynamic_node_feats[1::2, 2] = dest_flow  # flow
-    dynamic_node_feats[1::2, 3] = 0  # no label for dest (yet)
+    dynamic_node_feats[1::2, 3] = -999  # no label for dest (marker for unlabeled)
     dynamic_node_feats[1::2, 4] = 0  # no weight for dest (yet)
 
     # Handle NaN values in features (set to 0)
@@ -443,7 +448,32 @@ def train_model(
     dg = DGraph(data, device=device)
     loader = DGDataLoader(dg, batch_size=BATCH_SIZE, batch_unit=BATCH_UNIT)
     optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
-    criterion = nn.CrossEntropyLoss(reduction="none")
+
+    # First pass: compute label distribution for class weights
+    label_counts = {0: 0, 1: 0}
+    temp_loader = DGDataLoader(dg, batch_size=BATCH_SIZE, batch_unit=BATCH_UNIT)
+    for batch in temp_loader:
+        if batch.src.shape[0] == 0 or batch.node_ids is None:
+            continue
+        batch.dynamic_node_feats = batch.dynamic_node_feats.to(device)
+        has_label = batch.dynamic_node_feats[:, 3] != -999
+        if has_label.any():
+            labels_batch = batch.dynamic_node_feats[has_label, 3].long()
+            for label in labels_batch.cpu().numpy():
+                label_counts[int(label)] = label_counts.get(int(label), 0) + 1
+
+    # Compute class weights from full distribution
+    total = sum(label_counts.values())
+    class_weights = torch.ones(NUM_CLASSES, device=device)
+    if total > 0:
+        for i in range(NUM_CLASSES):
+            if label_counts[i] > 0:
+                class_weights[i] = total / (NUM_CLASSES * label_counts[i])
+        print(
+            f"Class weights: Down={class_weights[0]:.2f}, Up={class_weights[1]:.2f}",
+        )
+
+    criterion = nn.CrossEntropyLoss(weight=class_weights, reduction="none")
 
     # Track overall training statistics
     overall_start_time = time.time()
@@ -478,8 +508,9 @@ def train_model(
                 continue
 
             # Extract labels and weights from dynamic_node_feats
-            # Only use nodes with labels (src tokens, where label > 0)
-            has_label = batch.dynamic_node_feats[:, 3] > 0
+            # Only use nodes with labels (exclude -999 marker for unlabeled dest tokens)
+            # Binary labels: 0=down (no invest), 1=up (consider invest)
+            has_label = batch.dynamic_node_feats[:, 3] != -999
             y_true = batch.dynamic_node_feats[has_label, 3].long()
             batch_weights = batch.dynamic_node_feats[has_label, 4].float()
 
@@ -512,10 +543,17 @@ def train_model(
     overall_time = time.time() - overall_start_time
     start_loss = overall_first_loss if overall_first_loss is not None else 0.0
     end_loss = overall_final_loss if overall_final_loss is not None else 0.0
+    total_labels = sum(label_counts.values())
     print(
         f"Training completed in {overall_time:.2f}s - "
         f"Start loss: {start_loss:.4f}, End loss: {end_loss:.4f}",
     )
+    if total_labels > 0:
+        print(
+            f"Label distribution - Down: {label_counts[0]} "
+            f"({label_counts[0]/total_labels*100:.1f}%), "
+            f"Up: {label_counts[1]} ({label_counts[1]/total_labels*100:.1f}%)",
+        )
 
 
 def predict_top_tokens(
@@ -542,7 +580,8 @@ def predict_top_tokens(
     dg = DGraph(data, device=device)
     loader = DGDataLoader(dg, batch_size=BATCH_SIZE, batch_unit=BATCH_UNIT)
 
-    token_predictions: dict[int, list[int]] = {}
+    # Store probabilities instead of hard predictions for more robust confidence
+    token_probabilities: dict[int, list[float]] = {}
 
     with torch.no_grad():
         for batch in tqdm(loader, desc="Predict", leave=False):
@@ -564,26 +603,37 @@ def predict_top_tokens(
             if logits is None:
                 continue
 
-            preds = torch.argmax(logits, dim=1).cpu().numpy()
+            # Convert logits to probabilities using softmax
+            probs = torch.softmax(logits, dim=1)
+            # Extract probability of "up" class (index 1 in binary classification)
+            up_probs = probs[:, LABEL_UP].cpu().numpy()
 
-            # Get node_ids for labeled nodes only (src tokens)
-            has_label = batch.dynamic_node_feats[:, 3] > 0
+            # Get node_ids for labeled nodes only (exclude -999 marker for unlabeled dest tokens)
+            has_label = batch.dynamic_node_feats[:, 3] != -999
             labeled_node_ids = batch.node_ids[has_label].cpu().numpy()
 
-            for node_id, pred in zip(labeled_node_ids, preds):
-                if node_id not in token_predictions:
-                    token_predictions[node_id] = []
-                token_predictions[node_id].append(pred)
+            for node_id, prob in zip(labeled_node_ids, up_probs):
+                if node_id not in token_probabilities:
+                    token_probabilities[node_id] = []
+                token_probabilities[node_id].append(prob)
 
     recommendations: list[tuple[str, float]] = []
-    for node_id, pred_list in token_predictions.items():
-        up_count = sum(1 for p in pred_list if p == LABEL_UP)
-        bullish_score = up_count / len(pred_list)
+    for node_id, prob_list in token_probabilities.items():
+        # Average probability of "up" across all predictions for this token
+        bullish_score = np.mean(prob_list)
         token_addr = le.inverse_transform([node_id])[0]
         recommendations.append((token_addr, bullish_score))
 
+    # Sort by bullish score descending
     recommendations.sort(key=lambda x: x[1], reverse=True)
-    return recommendations[:top_n]
+
+    # Filter to only tokens predicted to go UP (probability > 0.5)
+    # Then take top N among those with positive predictions
+    bullish_recommendations = [
+        (addr, score) for addr, score in recommendations if score > 0.5
+    ]
+
+    return bullish_recommendations[:top_n]
 
 
 def calculate_daily_returns(
@@ -858,7 +908,25 @@ def backtest_slide(
             top_n=TOP_N_TOKENS,
         )
 
-        logger.info("Top 5 tokens predicted at 9am:")
+        logger.info(
+            "Top tokens predicted to go UP (score > 50%%) at 9am: %d",
+            len(top_tokens),
+        )
+
+        # Skip if no tokens meet the bullish threshold
+        if len(top_tokens) == 0:
+            logger.info("No tokens predicted to go up, skipping trading day")
+            results.append(
+                {
+                    "train_start": train_start_date,
+                    "train_end": train_end_date,
+                    "trade_date": trade_date,
+                    "top_tokens": [],
+                    "token_returns": {},
+                    "portfolio_return": 0.0,
+                },
+            )
+            continue
 
         # Calculate returns during trading window (9am-5pm)
         df_trading = df.filter(
@@ -890,7 +958,11 @@ def backtest_slide(
             )
 
         # Calculate equal-weighted portfolio return
-        portfolio_return = sum(token_returns.values()) / len(token_returns)
+        portfolio_return = (
+            sum(token_returns.values()) / len(token_returns)
+            if len(token_returns) > 0
+            else 0.0
+        )
         logger.info("Portfolio return: %+.2f%%", portfolio_return * 100)
 
         results.append(
