@@ -368,11 +368,18 @@ def build_window(
     dst = df_window["dest_token_encoded"].to_numpy()
     num_events = len(df_window)
 
-    # For each window, create local timestamps starting from 0
-    # This preserves relative timing within the window while making each window
-    # independent. Note: event_index maintains global ordering, but we renumber
-    # for local window time
-    edge_timestamps = np.arange(num_events, dtype=np.int64)
+    # Use real time deltas from window start (Phase 5 Issue 4 - Option A)
+    # This preserves temporal dynamics and Prado's "information time" concept
+    # Windows still start at t=0 (relative) but gaps reflect actual time differences
+    # Active periods: many bars/small time gaps; Inactive periods: few bars/large gaps
+    timestamps = df_window["bar_close_timestamp"].to_numpy()
+    first_timestamp = timestamps[0]
+    # Convert to milliseconds from window start for uniqueness/sorting stability
+    # Milliseconds prevent collisions when multiple swaps occur in same second
+    # while staying within TGM's int32 timestamp limits (~24 days at ms resolution)
+    edge_timestamps = (
+        (timestamps - first_timestamp) / np.timedelta64(1, "ms")
+    ).astype(np.int64)
 
     # Extract features for each swap event
     src_fracdiff = df_window["src_fracdiff"].to_numpy()
@@ -446,7 +453,7 @@ def build_window(
         node_timestamps=torch.from_numpy(node_timestamps),
         node_ids=torch.from_numpy(node_ids),
         dynamic_node_feats=torch.from_numpy(dynamic_node_feats),
-        time_delta="s",
+        time_delta="ms",  # Milliseconds for temporal resolution + uniqueness
     )
 
 

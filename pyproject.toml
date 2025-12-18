@@ -36,6 +36,9 @@ dependencies = [
     "web3>=7.14.0",
     "tgm-lib>=0.1.0b0",
     "scikit-learn>=1.7.2",
+    "umap-learn>=0.5.9.post2",
+    "seaborn>=0.13.2",
+    "pyarrow>=22.0.0",
 ]
 
 [dependency-groups]
