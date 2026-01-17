@@ -1,27 +1,43 @@
-"""Training Data Validation Script.
+"""Validate training data quality before TGNN model training.
 
-This script performs comprehensive sanity checks on the final labeled_log_fracdiff_price.parquet
-dataset before it's used for TGNN training. Based on plans/data_overview.md.
+WHY: Training ML models on invalid, corrupted, or poorly distributed data leads to
+unreliable predictions and wasted compute time. Following Prado's emphasis on data
+quality (AFML Ch. 4), we must validate the final labeled dataset to catch issues
+early. This includes checking for data integrity, statistical sanity, label quality,
+and temporal consistency.
 
-Validation Categories:
-1. Data Integrity: Non-null, finite values, no duplicates
-2. Statistical Sanity: Range checks, distribution health
-3. Feature Relationships: Correlations and logical consistency
-4. Label Quality: Balance, coverage, sample weights
-5. Temporal Consistency: Time ordering, no gaps
+WHAT: Comprehensive validation of the final labeled training dataset including:
+1. Data Integrity - Non-null, finite values, no duplicates, sorted timestamps
+2. Statistical Sanity - Range checks, distribution health, outlier detection
+3. Feature Relationships - Correlations and logical consistency
+4. Label Quality - Balance, coverage, sample weights per Prado Ch. 4
+5. Temporal Consistency - Time ordering, gap detection, temporal bias
+
+HOW: Load the parquet file and run a series of statistical checks and validations.
+Generate diagnostic plots showing distributions and relationships. Flag any concerns
+with clear PASS/WARN/FAIL indicators.
+
+INPUT: data/labeled_log_fracdiff_price.parquet (final labeled training data)
+OUTPUT: Console validation report + diagnostic plots in plots/validation/
+
+References:
+- Prado AFML Ch. 4: Sample Weights and Label Concurrency
+- Prado AFML Ch. 7: Cross-Validation for Financial Time Series
+
 """
 
 import logging
 from pathlib import Path
+from typing import Any
 
-import click
 import matplotlib.pyplot as plt
 import numpy as np
 import polars as pl
 import seaborn as sns
+import typer
+from rich.console import Console
 
-# %%
-# Configuration
+console = Console()
 logging.basicConfig(
     format="%(asctime)s %(levelname)s %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
@@ -31,7 +47,6 @@ logger = logging.getLogger(__name__)
 
 DATA_PATH = Path("data/labeled_log_fracdiff_price.parquet")
 PLOTS_DIR = Path("plots/validation")
-PLOTS_DIR.mkdir(parents=True, exist_ok=True)
 
 # Expected value ranges based on data_overview.md and statistical analysis
 EXPECTED_RANGES = {
@@ -47,11 +62,7 @@ EXPECTED_RANGES = {
 }
 
 
-# %%
-# Validation Functions
-
-
-def check_data_integrity(df: pl.DataFrame) -> dict[str, any]:
+def check_data_integrity(df: pl.DataFrame) -> dict[str, Any]:
     """Check for nulls, NaNs, infinities, and duplicates.
 
     Args:
@@ -68,7 +79,7 @@ def check_data_integrity(df: pl.DataFrame) -> dict[str, any]:
     results = {}
 
     # Shape
-    logger.info(f"Dataset shape: {df.shape[0]:,} rows × {df.shape[1]} columns")
+    logger.info(f"Dataset shape: {df.shape[0]:,} rows x {df.shape[1]} columns")
     results["total_rows"] = df.shape[0]
     results["total_columns"] = df.shape[1]
 
@@ -96,7 +107,7 @@ def check_data_integrity(df: pl.DataFrame) -> dict[str, any]:
         total_invalid = null_count + nan_count
         pct = (total_invalid / df.shape[0]) * 100
 
-        status = "✓ PASS" if total_invalid == 0 else "✗ WARN"
+        status = "✅ PASS" if total_invalid == 0 else "⚠️ WARN"
         logger.info(f"  {col:25} {total_invalid:>10,} ({pct:>6.2f}%) {status}")
 
         results[f"{col}_nulls"] = null_count
@@ -112,20 +123,20 @@ def check_data_integrity(df: pl.DataFrame) -> dict[str, any]:
         .shape[0]
     )
 
-    status = "✓ PASS" if dup_count == 0 else "✗ FAIL"
+    status = "✅ PASS" if dup_count == 0 else "❌ FAIL"
     logger.info(f"\nDuplicate rows (by time+pool+tokens): {dup_count:,} {status}")
     results["duplicate_rows"] = dup_count
 
     # Check timestamp ordering
     is_sorted = df["bar_close_timestamp"].is_sorted()
-    status = "✓ PASS" if is_sorted else "✗ WARN"
+    status = "✅ PASS" if is_sorted else "⚠️ WARN"
     logger.info(f"Timestamps sorted: {is_sorted} {status}")
     results["timestamps_sorted"] = is_sorted
 
     return results
 
 
-def check_statistical_sanity(df: pl.DataFrame) -> dict[str, any]:
+def check_statistical_sanity(df: pl.DataFrame) -> dict[str, Any]:
     """Check value ranges, outliers, and distributions.
 
     Args:
@@ -159,7 +170,7 @@ def check_statistical_sanity(df: pl.DataFrame) -> dict[str, any]:
                     pl.col(col).max().alias("max"),
                     pl.col(col).mean().alias("mean"),
                     pl.col(col).std().alias("std"),
-                ]
+                ],
             )
             .to_dicts()[0]
         )
@@ -171,7 +182,7 @@ def check_statistical_sanity(df: pl.DataFrame) -> dict[str, any]:
         min_ok = actual_min >= expected_min * 10  # 10x tolerance for minimums
         max_ok = actual_max <= expected_max * 10  # 10x tolerance for maximums
 
-        status = "✓ PASS" if (min_ok and max_ok) else "✗ WARN"
+        status = "✅ PASS" if (min_ok and max_ok) else "⚠️ WARN"
 
         logger.info(f"  {col:25}")
         logger.info(
@@ -194,14 +205,14 @@ def check_statistical_sanity(df: pl.DataFrame) -> dict[str, any]:
     for col in ["src_flow_usdc", "dest_flow_usdc"]:
         zero_count = df.filter(pl.col(col) == 0.0).shape[0]
         zero_pct = (zero_count / df.shape[0]) * 100
-        status = "✗ WARN" if zero_pct > 50 else "✓ PASS"
+        status = "⚠️ WARN" if zero_pct > 50 else "✅ PASS"
         logger.info(f"  {col} zeros: {zero_count:,} ({zero_pct:.2f}%) {status}")
         results[f"{col}_zero_pct"] = zero_pct
 
     # 2. Extremely low volatility (might indicate stagnant tokens)
     low_vol_count = df.filter(pl.col("rolling_volatility") < 1e-10).shape[0]
     low_vol_pct = (low_vol_count / df.shape[0]) * 100
-    status = "✗ WARN" if low_vol_pct > 10 else "✓ PASS"
+    status = "⚠️ WARN" if low_vol_pct > 10 else "✅ PASS"
     logger.info(
         f"  Near-zero volatility: {low_vol_count:,} ({low_vol_pct:.2f}%) {status}",
     )
@@ -214,7 +225,7 @@ def check_statistical_sanity(df: pl.DataFrame) -> dict[str, any]:
             mean = valid_df[col].mean()
             std = valid_df[col].std()
             # Stationary series should have mean near 0
-            status = "✓ PASS" if abs(mean) < 2.0 else "✗ WARN"
+            status = "✅ PASS" if abs(mean) < 2.0 else "⚠️ WARN"
             logger.info(
                 f"  {col} stationarity: mean={mean:.4f}, std={std:.4f} {status}",
             )
@@ -223,7 +234,7 @@ def check_statistical_sanity(df: pl.DataFrame) -> dict[str, any]:
     return results
 
 
-def check_feature_relationships(df: pl.DataFrame) -> dict[str, any]:
+def check_feature_relationships(df: pl.DataFrame) -> dict[str, Any]:
     """Check correlations and logical consistency between features.
 
     Args:
@@ -263,30 +274,26 @@ def check_feature_relationships(df: pl.DataFrame) -> dict[str, any]:
         data_array = corr_df.to_numpy()
         corr_matrix_values = np.corrcoef(data_array.T)
 
-        # Create a pandas-like structure for easier indexing
-        import pandas as pd
-
-        corr_matrix = pd.DataFrame(
-            corr_matrix_values,
-            index=feature_cols,
-            columns=feature_cols,
-        )
-
         logger.info("\nCorrelation matrix:")
-        logger.info(corr_matrix.to_string())
+        for i, col1 in enumerate(feature_cols):
+            row_vals = " ".join(
+                f"{corr_matrix_values[i, j]:>7.3f}" for j in range(len(feature_cols))
+            )
+            logger.info(f"  {col1:25} {row_vals}")
 
         # Save correlation heatmap
         plt.figure(figsize=(10, 8))
-        if HAS_SEABORN:
-            sns.heatmap(corr_matrix, annot=True, fmt=".3f", cmap="coolwarm", center=0)
-        else:
-            # Fallback to matplotlib imshow if seaborn not available
-            plt.imshow(corr_matrix, cmap="coolwarm", aspect="auto", vmin=-1, vmax=1)
-            plt.colorbar()
-            plt.xticks(
-                range(len(corr_matrix.columns)), corr_matrix.columns, rotation=45
-            )
-            plt.yticks(range(len(corr_matrix.columns)), corr_matrix.columns)
+        # Create heatmap using the numpy matrix directly
+        ax = sns.heatmap(
+            corr_matrix_values,
+            annot=True,
+            fmt=".3f",
+            cmap="coolwarm",
+            center=0,
+            xticklabels=feature_cols,
+            yticklabels=feature_cols,
+        )
+        ax.set_xticklabels(ax.get_xticklabels(), rotation=45, ha="right")
         plt.title("Feature Correlation Matrix")
         plt.tight_layout()
         plot_path = PLOTS_DIR / "correlation_matrix.png"
@@ -296,8 +303,10 @@ def check_feature_relationships(df: pl.DataFrame) -> dict[str, any]:
 
         # Check for concerning correlations
         # High correlation between src_flow and dest_flow would be suspicious
-        src_dest_corr = corr_matrix.loc["src_flow_usdc", "dest_flow_usdc"]
-        status = "✓ PASS" if abs(src_dest_corr) < 0.5 else "✗ WARN"
+        src_idx = feature_cols.index("src_flow_usdc")
+        dest_idx = feature_cols.index("dest_flow_usdc")
+        src_dest_corr = corr_matrix_values[src_idx, dest_idx]
+        status = "✅ PASS" if abs(src_dest_corr) < 0.5 else "⚠️ WARN"
         logger.info(
             f"\nsrc_flow vs dest_flow correlation: {src_dest_corr:.3f} {status}",
         )
@@ -321,14 +330,14 @@ def check_feature_relationships(df: pl.DataFrame) -> dict[str, any]:
         for row in label_counts.sort("label").iter_rows(named=True):
             pct = (row["count"] / labeled_df.shape[0]) * 100
             logger.info(
-                f"  Label {row['label']:>4.0f}: {row['count']:>10,} ({pct:>5.2f}%)"
+                f"  Label {row['label']:>4.0f}: {row['count']:>10,} ({pct:>5.2f}%)",
             )
         results["label_distribution"] = label_counts.to_dicts()
 
     return results
 
 
-def check_label_quality(df: pl.DataFrame) -> dict[str, any]:
+def check_label_quality(df: pl.DataFrame) -> dict[str, Any]:
     """Check label balance, coverage, and sample weights.
 
     Args:
@@ -365,7 +374,7 @@ def check_label_quality(df: pl.DataFrame) -> dict[str, any]:
     ).shape[0]
     either_pct = (either_labeled / df.shape[0]) * 100
 
-    status = "✓ PASS" if either_pct > 10 else "✗ FAIL"
+    status = "✅ PASS" if either_pct > 10 else "❌ FAIL"
     logger.info(
         f"At least one label: {either_labeled:,} ({either_pct:.2f}%) {status}",
     )
@@ -392,7 +401,7 @@ def check_label_quality(df: pl.DataFrame) -> dict[str, any]:
 
         # Check for severe imbalance (smallest class < 10% of largest)
         imbalance_ratio = min_count / max_count if max_count > 0 else 0
-        status = "✗ WARN" if imbalance_ratio < 0.1 else "✓ PASS"
+        status = "⚠️ WARN" if imbalance_ratio < 0.1 else "✅ PASS"
         logger.info(
             f"\nClass balance ratio (min/max): {imbalance_ratio:.3f} {status}",
         )
@@ -413,14 +422,14 @@ def check_label_quality(df: pl.DataFrame) -> dict[str, any]:
                     pl.col(col).min().alias("min"),
                     pl.col(col).max().alias("max"),
                     pl.col(col).mean().alias("mean"),
-                ]
+                ],
             ).to_dicts()[0]
 
             # Weights should be in [0, 1] and have reasonable mean
             status = (
-                "✓ PASS"
+                "✅ PASS"
                 if (0 <= stats["min"] <= 1 and 0 <= stats["max"] <= 1)
-                else "✗ WARN"
+                else "⚠️ WARN"
             )
 
             logger.info(
@@ -442,7 +451,7 @@ def check_label_quality(df: pl.DataFrame) -> dict[str, any]:
                 pl.col("barrier_touch_bars").max().alias("max"),
                 pl.col("barrier_touch_bars").mean().alias("mean"),
                 pl.col("barrier_touch_bars").median().alias("median"),
-            ]
+            ],
         )
         .to_dicts()[0]
     )
@@ -456,7 +465,7 @@ def check_label_quality(df: pl.DataFrame) -> dict[str, any]:
     return results
 
 
-def check_temporal_consistency(df: pl.DataFrame) -> dict[str, any]:
+def check_temporal_consistency(df: pl.DataFrame) -> dict[str, Any]:
     """Check time ordering, gaps, and temporal patterns.
 
     Args:
@@ -493,7 +502,7 @@ def check_temporal_consistency(df: pl.DataFrame) -> dict[str, any]:
                 pl.col("time_diff").min().alias("min_gap"),
                 pl.col("time_diff").max().alias("max_gap"),
                 pl.col("time_diff").mean().alias("mean_gap"),
-            ]
+            ],
         ).to_dicts()[0]
 
         logger.info("\nTime gaps between consecutive bars:")
@@ -503,7 +512,7 @@ def check_temporal_consistency(df: pl.DataFrame) -> dict[str, any]:
 
         # Flag if max gap > 1 hour (might indicate data issues)
         max_gap_seconds = gap_stats["max_gap"].total_seconds()
-        status = "✗ WARN" if max_gap_seconds > 3600 else "✓ PASS"
+        status = "⚠️ WARN" if max_gap_seconds > 3600 else "✅ PASS"
         logger.info(f"  Max gap in seconds: {max_gap_seconds:.0f} {status}")
         results["max_gap_seconds"] = max_gap_seconds
 
@@ -530,7 +539,7 @@ def check_temporal_consistency(df: pl.DataFrame) -> dict[str, any]:
         pl.col("count") < median_daily * 0.1,
     ).shape[0]
 
-    status = "✗ WARN" if low_activity_days > daily_counts.shape[0] * 0.1 else "✓ PASS"
+    status = "⚠️ WARN" if low_activity_days > daily_counts.shape[0] * 0.1 else "✅ PASS"
     logger.info(
         f"  Days with low activity (< 10% median): {low_activity_days} {status}",
     )
@@ -597,7 +606,11 @@ def generate_summary_plots(df: pl.DataFrame) -> None:
         else:
             # Histogram for continuous features
             ax.hist(
-                valid_data, bins=50, alpha=0.7, color="steelblue", edgecolor="black"
+                valid_data,
+                bins=50,
+                alpha=0.7,
+                color="steelblue",
+                edgecolor="black",
             )
             ax.set_xlabel(col)
             ax.set_ylabel("Frequency")
@@ -643,24 +656,21 @@ def generate_summary_plots(df: pl.DataFrame) -> None:
         plt.close()
 
 
-# %%
-# Main orchestration
-
-
-@click.command()
-@click.option(
-    "--data-path",
-    type=click.Path(exists=True, path_type=Path),
-    default=DATA_PATH,
-    help="Path to labeled_log_fracdiff_price.parquet",
-)
-@click.option(
-    "--skip-plots",
-    is_flag=True,
-    help="Skip plot generation for faster execution",
-)
-def main(data_path: Path, skip_plots: bool) -> None:
+def main(
+    data_path: Path = typer.Option(
+        DATA_PATH,
+        exists=True,
+        help="Path to labeled_log_fracdiff_price.parquet",
+    ),
+    skip_plots: bool = typer.Option(
+        False,
+        "--skip-plots",
+        help="Skip plot generation for faster execution",
+    ),
+) -> None:
     """Run comprehensive validation on training data."""
+    # Ensure plots directory exists
+    PLOTS_DIR.mkdir(parents=True, exist_ok=True)
     logger.info("=" * 60)
     logger.info("TRAINING DATA VALIDATION")
     logger.info("=" * 60)
@@ -688,9 +698,9 @@ def main(data_path: Path, skip_plots: bool) -> None:
     logger.info("\n" + "=" * 60)
     logger.info("VALIDATION COMPLETE")
     logger.info("=" * 60)
-    logger.info("Review the output above for any ✗ FAIL or ✗ WARN markers.")
+    logger.info("Review the output above for any ❌ FAIL or ⚠️ WARN markers.")
     logger.info(f"Plots saved to: {PLOTS_DIR}")
 
 
 if __name__ == "__main__":
-    main()
+    typer.run(main)

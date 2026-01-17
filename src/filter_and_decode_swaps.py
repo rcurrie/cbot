@@ -1,16 +1,35 @@
-"""Filter USDC-paired swaps from raw swap data.
+"""Filter and decode USDC-connected swap events from raw blockchain data.
 
-Load all parquet files from data/swaps/, filter to only Uniswap V3 Swap events
-that involve USDC-paired tokens.
+WHY: We focus on USDC-connected tokens to establish a consistent numeraire for pricing.
+Direct USDC pairs provide ground truth prices, while indirect pairs (e.g., ETH/WBTC)
+can be priced via transitive relationships. This connectivity graph approach ensures all
+tokens have paths to price discovery through USDC, the market's primary stablecoin.
 
-This script outputs a parquet file with one row per swap, keeping the raw data
-field for on-demand decoding. It filters to include:
-1. Swaps that have USDC as one of the tokens
-2. Swaps between tokens A and B where both A and B have pools with USDC
+WHAT: Extract and filter Uniswap V3 swap events to create a connected subgraph where:
+1. Direct swaps: Either token is USDC (ground truth prices)
+2. Indirect swaps: Both tokens have separate pools with USDC (inferred pricing)
+
+This filtering creates a connected price graph while dramatically reducing data volume
+from ~hundreds of thousands of token pairs to ~thousands of relevant tokens.
+
+HOW:
+1. Load raw swap events from BigQuery parquet exports
+2. Decode Uniswap V3 event signatures and extract pool/token addresses
+3. Build connectivity graph using pools.json to identify USDC-paired tokens
+4. Filter to swaps involving tokens in the USDC-connected subgraph
+5. Validate data quality (duplicates, nulls, timestamps, decodability)
+
+INPUT: data/swaps/*.parquet (raw BigQuery exports), data/pools.json (pool metadata)
+OUTPUT: data/usdc_paired_swaps.parquet (filtered swap events with raw hex data preserved)
+
+References:
+- Prado AFML: Not directly covered, but follows information sampling principles
+- Uniswap V3 event structure: https://docs.uniswap.org/contracts/v3/reference/core/interfaces/pool/IUniswapV3PoolEvents
 """
 
 import json
 import logging
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -278,9 +297,9 @@ def validate_output(df: pl.DataFrame) -> None:
     )
     if dup_count > 0:
         issues_found.append(f"Found {dup_count:,} duplicate swaps (same tx + pool)")
-        logger.warning("  ✗ WARN: %d duplicate swaps detected", dup_count)
+        logger.warning("  ⚠️ WARN: %d duplicate swaps detected", dup_count)
     else:
-        logger.info("  ✓ PASS: No duplicate swaps")
+        logger.info("  ✅ PASS: No duplicate swaps")
 
     # 2. Check for null/missing values in critical columns
     logger.info("Checking for null values in critical columns...")
@@ -297,9 +316,9 @@ def validate_output(df: pl.DataFrame) -> None:
         if null_count > 0:
             pct = (null_count / df.shape[0]) * 100
             issues_found.append(f"{col} has {null_count:,} nulls ({pct:.2f}%)")
-            logger.warning("  ✗ WARN: %s has %d nulls (%.2f%%)", col, null_count, pct)
+            logger.warning("  ⚠️ WARN: %s has %d nulls (%.2f%%)", col, null_count, pct)
         else:
-            logger.info("  ✓ PASS: %s has no nulls", col)
+            logger.info("  ✅ PASS: %s has no nulls", col)
 
     # 3. Validate hex data format (should start with 0x and have correct length)
     logger.info("Validating hex data format...")
@@ -312,9 +331,9 @@ def validate_output(df: pl.DataFrame) -> None:
         issues_found.append(
             f"{invalid_hex_count:,} swaps have invalid hex data ({pct:.2f}%)",
         )
-        logger.warning("  ✗ WARN: %d swaps with invalid hex data", invalid_hex_count)
+        logger.warning("  ⚠️ WARN: %d swaps with invalid hex data", invalid_hex_count)
     else:
-        logger.info("  ✓ PASS: All hex data properly formatted")
+        logger.info("  ✅ PASS: All hex data properly formatted")
 
     # 4. Validate token addresses (should be 42 chars with 0x prefix)
     logger.info("Validating token addresses...")
@@ -326,12 +345,12 @@ def validate_output(df: pl.DataFrame) -> None:
             f"{invalid_token1:,} invalid token1 addresses",
         )
         logger.warning(
-            "  ✗ WARN: %d invalid token0, %d invalid token1 addresses",
+            "  ⚠️ WARN: %d invalid token0, %d invalid token1 addresses",
             invalid_token0,
             invalid_token1,
         )
     else:
-        logger.info("  ✓ PASS: All token addresses valid")
+        logger.info("  ✅ PASS: All token addresses valid")
 
     # 5. Validate decimals (should be 0-18, typically)
     logger.info("Validating token decimals...")
@@ -347,12 +366,12 @@ def validate_output(df: pl.DataFrame) -> None:
             f"{invalid_decimals1:,} invalid token1 decimals",
         )
         logger.warning(
-            "  ✗ WARN: %d invalid token0, %d invalid token1 decimals",
+            "  ⚠️ WARN: %d invalid token0, %d invalid token1 decimals",
             invalid_decimals0,
             invalid_decimals1,
         )
     else:
-        logger.info("  ✓ PASS: All token decimals valid")
+        logger.info("  ✅ PASS: All token decimals valid")
 
     # Log unusual decimal values
     logger.info("  Token decimals distribution (token0):")
@@ -369,9 +388,9 @@ def validate_output(df: pl.DataFrame) -> None:
     is_sorted = df["block_timestamp"].is_sorted()
     if not is_sorted:
         issues_found.append("Timestamps are not sorted")
-        logger.warning("  ✗ WARN: Timestamps not sorted")
+        logger.warning("  ⚠️ WARN: Timestamps not sorted")
     else:
-        logger.info("  ✓ PASS: Timestamps sorted")
+        logger.info("  ✅ PASS: Timestamps sorted")
 
     # 7. Check for large time gaps
     logger.info("Checking for large time gaps...")
@@ -383,14 +402,14 @@ def validate_output(df: pl.DataFrame) -> None:
         max_gap_seconds = max_gap.total_seconds() if max_gap else 0
         if max_gap_seconds > 3600:  # 1 hour
             logger.warning(
-                "  ✗ WARN: Large time gap detected: %s (%.0f seconds)",
+                "  ⚠️ WARN: Large time gap detected: %s (%.0f seconds)",
                 max_gap,
                 max_gap_seconds,
             )
             issues_found.append(f"Max time gap: {max_gap_seconds:.0f} seconds")
         else:
             logger.info(
-                "  ✓ PASS: No large time gaps (max: %.0f seconds)",
+                "  ✅ PASS: No large time gaps (max: %.0f seconds)",
                 max_gap_seconds,
             )
 
@@ -419,13 +438,13 @@ def validate_output(df: pl.DataFrame) -> None:
             f"{decode_failures}/{sample_size} swaps failed to decode ({pct:.1f}%)",
         )
         logger.warning(
-            "  ✗ WARN: %d/%d swaps failed to decode (%.1f%%)",
+            "  ⚠️ WARN: %d/%d swaps failed to decode (%.1f%%)",
             decode_failures,
             sample_size,
             pct,
         )
     else:
-        logger.info("  ✓ PASS: All sampled swaps decode successfully")
+        logger.info("  ✅ PASS: All sampled swaps decode successfully")
 
     # 9. Check for unusual patterns that might indicate data issues
     logger.info("Checking for unusual patterns...")
@@ -449,10 +468,14 @@ def validate_output(df: pl.DataFrame) -> None:
         top_100_count = addr_counts.head(100)["count"].sum()
 
         conc_10 = (
-            (top_10_count / same_sender_recipient * 100) if same_sender_recipient > 0 else 0
+            (top_10_count / same_sender_recipient * 100)
+            if same_sender_recipient > 0
+            else 0
         )
         conc_100 = (
-            (top_100_count / same_sender_recipient * 100) if same_sender_recipient > 0 else 0
+            (top_100_count / same_sender_recipient * 100)
+            if same_sender_recipient > 0
+            else 0
         )
 
         logger.info(
@@ -491,7 +514,7 @@ def validate_output(df: pl.DataFrame) -> None:
         for issue in issues_found:
             logger.warning("  - %s", issue)
     else:
-        logger.info("VALIDATION SUMMARY: All checks passed ✓")
+        logger.info("VALIDATION SUMMARY: All checks passed ✅")
     logger.info("=" * 60)
 
 
@@ -499,6 +522,8 @@ def filter_and_decode_usdc_swaps(
     input_dir: Path,
     output_file: Path,
     pools_file: Path,
+    start_date: datetime | None = None,
+    end_date: datetime | None = None,
 ) -> None:
     """Filter and decode USDC-paired swaps from raw swap data.
 
@@ -511,6 +536,8 @@ def filter_and_decode_usdc_swaps(
         input_dir: Directory containing input parquet files.
         output_file: Output parquet file for filtered and decoded swaps.
         pools_file: Path to pools.json file.
+        start_date: Optional start date to filter swaps (inclusive).
+        end_date: Optional end date to filter swaps (inclusive).
 
     """
     usdc_paired_tokens, all_pool_tokens_map, uniswap_v3_pools = load_all_pools(
@@ -530,6 +557,12 @@ def filter_and_decode_usdc_swaps(
     )
 
     logger.info("Loading and filtering swap data from %s...", input_dir)
+    if start_date or end_date:
+        logger.info(
+            "  Date range: %s to %s",
+            start_date.strftime("%Y-%m-%d") if start_date else "beginning",
+            end_date.strftime("%Y-%m-%d") if end_date else "end",
+        )
 
     # Use lazy evaluation to efficiently:
     # 1. Read all parquet files
@@ -537,7 +570,7 @@ def filter_and_decode_usdc_swaps(
     # 3. Filter to V3 swaps
     # 4. Join with pool info
     # 5. Filter to USDC-paired swaps
-    df = (
+    lazy_df = (
         pl.scan_parquet(input_dir / "*.parquet")
         .sort("block_timestamp")  # Sort immediately after loading
         .with_columns(
@@ -549,8 +582,21 @@ def filter_and_decode_usdc_swaps(
             pl.col("event_signature") == f"0x{V3_SWAP_SIGNATURE}",
         )
         .drop("event_signature")  # Drop temporary column
-        .collect()  # Execute the lazy query
     )
+
+    # Apply date filtering if specified
+    if start_date:
+        lazy_df = lazy_df.filter(pl.col("block_timestamp") >= start_date)
+    if end_date:
+        # Make end_date inclusive by setting time to end of day
+        end_datetime = datetime.combine(
+            end_date.date(),
+            datetime.max.time(),
+            tzinfo=UTC,
+        )
+        lazy_df = lazy_df.filter(pl.col("block_timestamp") <= end_datetime)
+
+    df = lazy_df.collect()  # Execute the lazy query
 
     logger.info("Filtered to %s Uniswap V3 swap events", f"{len(df):,}")
 
@@ -722,6 +768,16 @@ def main(
         "--pools-file",
         help="JSON file with pool information",
     ),
+    start_date: str | None = typer.Option(
+        None,
+        "--start-date",
+        help="Start date to filter swaps (YYYY-MM-DD, inclusive)",
+    ),
+    end_date: str | None = typer.Option(
+        None,
+        "--end-date",
+        help="End date to filter swaps (YYYY-MM-DD, inclusive)",
+    ),
     verbose: bool = typer.Option(
         False,
         "--verbose",
@@ -740,7 +796,25 @@ def main(
     output_path = Path(output_file)
     pools_path = Path(pools_file)
 
-    filter_and_decode_usdc_swaps(input_path, output_path, pools_path)
+    # Parse dates if provided (make timezone-aware to match BigQuery timestamps)
+    start_dt = (
+        datetime.strptime(start_date, "%Y-%m-%d").replace(tzinfo=UTC)
+        if start_date
+        else None
+    )
+    end_dt = (
+        datetime.strptime(end_date, "%Y-%m-%d").replace(tzinfo=UTC)
+        if end_date
+        else None
+    )
+
+    filter_and_decode_usdc_swaps(
+        input_path,
+        output_path,
+        pools_path,
+        start_dt,
+        end_dt,
+    )
 
 
 if __name__ == "__main__":

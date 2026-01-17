@@ -216,7 +216,7 @@ PyTorch's `CrossEntropyLoss` expects:
 - Input: `[batch_size, num_classes]` logits
 - Target: `[batch_size]` class indices (0-indexed, [0, num_classes))
 
-Our label transformation: {-1, 0, 1} + 1 = {0, 1, 2} ✓
+Our label transformation: {-1, 0, 1} + 1 = {0, 1, 2} ✅
 
 ### Temporal Materialization
 

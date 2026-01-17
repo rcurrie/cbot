@@ -1,12 +1,40 @@
-"""Make target variable stationary using fractional differentiation.
+"""Make price series stationary while preserving memory via fractional differentiation.
 
-This script implements Milestone 2 of Phase 2:
-- Load usdc_bars.parquet
-- Group by token_id
-- Apply log transformation to token_close_price_usdc
-- Find minimum fractional differentiation order d for each token
-- Apply fractional differentiation to achieve stationarity
-- Output log_fracdiff_price.parquet
+WHY: Most ML models assume stationarity (constant statistical properties over time),
+but raw price series are non-stationary by nature. Traditional differencing (d=1)
+achieves stationarity but destroys all memory/autocorrelation, losing valuable
+predictive information. Prado (AFML Ch. 5) introduces fractional differentiation,
+which allows us to achieve stationarity with minimal memory loss by using the minimum
+necessary differentiation order (d).
+
+This is critical for crypto markets where momentum and mean-reversion patterns exist
+at multiple time scales. We want to preserve as much of this information as possible
+while meeting the stationarity requirement for ML models.
+
+WHAT: For each token's price series:
+1. Apply log transformation to stabilize variance
+2. Search for minimum fractional differentiation order d ∈ [0, 1]
+3. Use ADF (Augmented Dickey-Fuller) test to verify stationarity (p < 0.05)
+4. Apply fractional differentiation with found d to create stationary target
+5. Join fractionally differentiated features back to bars
+
+This gives us a stationary target variable that retains maximum predictive power
+from the original price series.
+
+HOW:
+1. Extract unique price observations for all tokens (src and dest)
+2. For each token, compute fractional diff weights: w_k = w_{k-1} * (d-k+1)/k
+3. Apply convolution of weights to log prices
+4. Binary search for minimum d where ADF test rejects null (p < 0.05)
+5. Store d per token and join fracdiff values back to bar events
+
+INPUT: data/usdc_bars.parquet (dollar bars with prices)
+OUTPUT: data/log_fracdiff_price.parquet (bars with stationary target features)
+
+References:
+- Prado AFML Ch. 5.1-5.3: Fractional Differentiation
+- Hosking (1981): Original fractional integration/differentiation theory
+
 """
 
 import logging
@@ -15,6 +43,13 @@ from pathlib import Path
 import numpy as np
 import polars as pl
 import typer
+from rich.progress import (
+    BarColumn,
+    Progress,
+    SpinnerColumn,
+    TextColumn,
+    TimeRemainingColumn,
+)
 from statsmodels.tsa.stattools import adfuller  # type: ignore[import-untyped]
 
 logger = logging.getLogger(__name__)
@@ -57,17 +92,18 @@ def frac_diff_fixed(
     return result
 
 
-MIN_ADF_OBSERVATIONS = 20
-
-
 def find_min_d_for_stationarity(
     log_price: np.ndarray,
     d_min: float = 0.0,
     d_max: float = 1.0,
     d_step: float = 0.05,
     p_value_threshold: float = 0.05,
+    min_observations: int = 20,
+    adf_regression: str = "ct",
 ) -> tuple[float, bool]:
     """Find minimum fractional differentiation order for stationarity.
+
+    Uses ADF test with optional trend adjustment to handle trend-stationary series.
 
     Args:
         log_price: Log-transformed price series.
@@ -75,6 +111,12 @@ def find_min_d_for_stationarity(
         d_max: Maximum d to search.
         d_step: Step size for search.
         p_value_threshold: ADF test p-value threshold (default 0.05).
+        min_observations: Minimum observations required for ADF test.
+        adf_regression: ADF test regression type:
+            - 'c': Constant only (default behavior)
+            - 'ct': Constant and trend (handles trend-stationary series)
+            - 'ctt': Constant, linear and quadratic trend
+            - 'n': No constant, no trend
 
     Returns:
         Tuple of (minimum_d, is_stationary).
@@ -94,12 +136,12 @@ def find_min_d_for_stationarity(
         fracdiff_clean = fracdiff_series[~np.isnan(fracdiff_series)]
 
         # Need sufficient data for ADF test
-        if len(fracdiff_clean) < MIN_ADF_OBSERVATIONS:
+        if len(fracdiff_clean) < min_observations:
             continue
 
         try:
-            # Run ADF test
-            adf_result = adfuller(fracdiff_clean, autolag="AIC")
+            # Run ADF test with specified regression type
+            adf_result = adfuller(fracdiff_clean, autolag="AIC", regression=adf_regression)
             p_value = adf_result[1]
 
             if p_value < p_value_threshold:
@@ -119,6 +161,10 @@ def _process_token_group(
     d_min: float,
     d_max: float,
     d_step: float,
+    min_observations: int,
+    adf_regression: str,
+    *,
+    standardize: bool,
 ) -> tuple[pl.DataFrame | None, dict[str, object]]:
     """Process a single token group for stationarity.
 
@@ -128,6 +174,9 @@ def _process_token_group(
         d_min: Minimum d to search.
         d_max: Maximum d to search.
         d_step: Step size for d search.
+        min_observations: Minimum observations required for ADF test.
+        adf_regression: ADF test regression type.
+        standardize: If True, standardize fracdiff series to mean=0, std=1.
 
     Returns:
         Tuple of (processed_df, token_stats_dict). processed_df is None if token
@@ -142,7 +191,7 @@ def _process_token_group(
 
     # Check if log_prices are valid
     if np.any(np.isnan(log_prices)) or np.any(np.isinf(log_prices)):
-        logger.warning("Token %s has invalid log prices, skipping", token_id)
+        logger.warning("Token %s has invalid log prices, skipping", token_id[:10] + "...")
         return (
             None,
             {
@@ -155,12 +204,38 @@ def _process_token_group(
             },
         )
 
+    # Check for constant or near-constant series (stablecoins, pegged assets)
+    price_std = float(np.std(log_prices))
+    if price_std < 1e-6:
+        logger.info(
+            "Token %s has constant price (stablecoin/pegged?), using d=0",
+            token_id[:10] + "...",
+        )
+        # Constant series is technically stationary
+        fracdiff_log_price = log_prices.copy()
+        if standardize:
+            # For constant series, standardization would create NaNs, so keep as-is
+            pass
+        return (
+            token_df.with_columns([pl.Series("fracdiff", fracdiff_log_price)]),
+            {
+                "token_id": token_id,
+                "n_observations": len(token_df),
+                "min_d": 0.0,
+                "is_stationary": True,
+                "n_valid_after_fracdiff": len(log_prices),
+                "dropped": False,
+            },
+        )
+
     # Find minimum d for stationarity
     min_d, is_stationary = find_min_d_for_stationarity(
         log_prices,
         d_min=d_min,
         d_max=d_max,
         d_step=d_step,
+        min_observations=min_observations,
+        adf_regression=adf_regression,
     )
 
     stats: dict[str, object] = {
@@ -183,9 +258,18 @@ def _process_token_group(
 
     # Apply fractional differentiation with the found d
     if min_d == 0:
-        fracdiff_log_price = log_prices
+        fracdiff_log_price = log_prices.copy()
     else:
         fracdiff_log_price = frac_diff_fixed(log_prices, min_d)
+
+    # Optionally standardize to mean=0, std=1
+    if standardize:
+        valid_vals = fracdiff_log_price[~np.isnan(fracdiff_log_price)]
+        if len(valid_vals) > 0:
+            mean_val = float(np.mean(valid_vals))
+            std_val = float(np.std(valid_vals))
+            if std_val > 1e-8:  # Avoid division by zero
+                fracdiff_log_price = (fracdiff_log_price - mean_val) / std_val
 
     # Store statistics
     stats["n_valid_after_fracdiff"] = int(np.sum(~np.isnan(fracdiff_log_price)))
@@ -204,8 +288,11 @@ def make_stationary(
     d_min: float = 0.0,
     d_max: float = 1.0,
     d_step: float = 0.05,
+    min_observations: int = 20,
+    adf_regression: str = "ct",
     *,
     drop_non_stationary: bool = False,
+    standardize: bool = False,
 ) -> None:
     """Make target variable stationary using fractional differentiation.
 
@@ -215,7 +302,10 @@ def make_stationary(
         d_min: Minimum fractional differentiation order to search.
         d_max: Maximum fractional differentiation order to search.
         d_step: Step size for d search.
+        min_observations: Minimum observations required for ADF test.
+        adf_regression: ADF test regression type ('c', 'ct', 'ctt', 'n').
         drop_non_stationary: If True, drop all tokens that don't achieve stationarity.
+        standardize: If True, standardize fracdiff series to mean=0, std=1.
 
     """
     logger.info("Loading data from %s...", input_file)
@@ -265,30 +355,49 @@ def make_stationary(
         d_max,
         d_step,
     )
+    logger.info("ADF regression type: %s", adf_regression)
+    logger.info("Standardize: %s", standardize)
 
-    # Process each token group
+    # Process each token group with progress bar
     all_fracdiff_rows: list[pl.DataFrame] = []
     token_stats: list[dict[str, object]] = []
 
-    for token_tuple, token_group in df_prices.group_by("token_id", maintain_order=True):
-        token_id = token_tuple[0]  # Extract scalar from tuple
-        token_df = token_group.sort("bar_close_timestamp")
+    token_groups = list(df_prices.group_by("token_id", maintain_order=True))
+    n_tokens = len(token_groups)
 
-        result_df, stats = _process_token_group(
-            token_id,
-            token_df,
-            d_min,
-            d_max,
-            d_step,
-        )
-        token_stats.append(stats)
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+        TimeRemainingColumn(),
+    ) as progress:
+        task = progress.add_task("Processing tokens", total=n_tokens)
 
-        should_include = result_df is not None and (
-            not drop_non_stationary or stats["is_stationary"]
-        )
-        if should_include:
-            assert result_df is not None
-            all_fracdiff_rows.append(result_df)
+        for token_tuple, token_group in token_groups:
+            token_id = token_tuple[0]  # Extract scalar from tuple
+            token_df = token_group.sort("bar_close_timestamp")
+
+            result_df, stats = _process_token_group(
+                token_id,
+                token_df,
+                d_min,
+                d_max,
+                d_step,
+                min_observations,
+                adf_regression,
+                standardize=standardize,
+            )
+            token_stats.append(stats)
+
+            should_include = result_df is not None and (
+                not drop_non_stationary or stats["is_stationary"]
+            )
+            if should_include:
+                assert result_df is not None
+                all_fracdiff_rows.append(result_df)
+
+            progress.update(task, advance=1)
 
     # Combine all token fracdiff series
     logger.info("\nCombining results from all tokens...")
@@ -441,7 +550,7 @@ def validate_output(
     if missing_cols:
         msg = f"Missing required columns: {missing_cols}"
         raise RuntimeError(msg)
-    logger.info("  ✓ All required columns present")
+    logger.info("  ✅ All required columns present")
 
     # Check data types
     logger.info("  Column data types:")
@@ -456,7 +565,7 @@ def validate_output(
         nan_counts[col_name] = nan_count
         if nan_count > 0:
             logger.warning("    %s has %d NaN values", col_name, nan_count)
-    logger.info("  ✓ NaN check complete: %s", nan_counts)
+    logger.info("  ✅ NaN check complete: %s", nan_counts)
 
     # Check src_fracdiff statistics
     fracdiff_stats = df.select(
@@ -480,15 +589,15 @@ def validate_output(
     # Check unique token counts
     n_tokens = df["src_token_id"].n_unique()
     n_pools = df["pool_id"].n_unique()
-    logger.info("  ✓ Unique source tokens: %d", n_tokens)
-    logger.info("  ✓ Unique pools: %d", n_pools)
+    logger.info("  ✅ Unique source tokens: %d", n_tokens)
+    logger.info("  ✅ Unique pools: %d", n_pools)
 
     # Check date range
     date_min = df["bar_close_timestamp"].min()
     date_max = df["bar_close_timestamp"].max()
-    logger.info("  ✓ Date range: %s to %s", date_min, date_max)
+    logger.info("  ✅ Date range: %s to %s", date_min, date_max)
 
-    logger.info("✓ Validation passed!")
+    logger.info("✅ Validation passed!")
 
 
 def main(
@@ -512,9 +621,21 @@ def main(
         0.05,
         help="Step size for d search",
     ),
+    min_observations: int = typer.Option(
+        20,
+        help="Minimum observations required for ADF test",
+    ),
+    adf_regression: str = typer.Option(
+        "ct",
+        help="ADF test regression type: 'c' (constant), 'ct' (constant+trend), 'ctt' (quadratic), 'n' (none)",
+    ),
     drop_non_stationary: bool = typer.Option(
         False,
         help="Drop tokens that don't achieve stationarity",
+    ),
+    standardize: bool = typer.Option(
+        False,
+        help="Standardize fracdiff series to mean=0, std=1",
     ),
     validate: bool = typer.Option(
         False,
@@ -538,7 +659,10 @@ def main(
         d_min,
         d_max,
         d_step,
+        min_observations,
+        adf_regression,
         drop_non_stationary=drop_non_stationary,
+        standardize=standardize,
     )
 
     if validate:

@@ -1,12 +1,36 @@
-"""Generate pool-level usdc bars with signed net flows from USDC-paired swaps.
+"""Generate information-driven dollar bars with directional flow from swap events.
 
-This script implements Milestone 1 of Phase 2:
-- Groups swaps by pool_id
-- Accumulates swaps into dollar bars based on target_usdc_bar_size
-- Calculates signed net flows for each token in the bar
-- Determines primary flow direction (src -> dest) based on dominant flow
-- Generates one output row per bar with src and dest token information
-- Outputs usdc_bars.parquet with bar statistics and signed flows
+WHY: Traditional time-based sampling (e.g., daily OHLCV) ignores information arrival
+rate. Prado (AFML Ch. 2) advocates for information-driven bars that sample when
+meaningful activity occurs. Dollar bars accumulate swaps until a threshold dollar
+volume is reached, creating bars that are information-homogeneous rather than
+time-homogeneous. This is crucial for ML as each bar represents similar "information
+content" regardless of calendar time elapsed.
+
+WHAT: Transform swap-level price observations into pool-level dollar bars where:
+1. Bars close when cumulative USDC volume reaches target threshold ($100k default)
+2. Each bar captures signed net flows (buy/sell pressure) for both tokens
+3. Primary flow direction (src → dest) determined by dominant volume
+4. Time delta between bars captures liquidity dynamics
+
+This creates a feature-rich representation for temporal graph neural networks, where
+each bar becomes a directed edge in the token graph with flow magnitudes as features.
+
+HOW:
+1. Group price observations by pool and process chronologically
+2. Accumulate USDC volume and signed flows until threshold reached
+3. Calculate bar features: time delta, tick count, net flows, closing prices
+4. Assign src/dest based on which token has larger absolute flow
+5. Filter illiquid tokens (>20% bars with >1 day time delta)
+6. Validate output and optionally compare to CoinGecko ground truth
+
+INPUT: data/usdc_priced_swaps.parquet (price time series)
+OUTPUT: data/usdc_bars.parquet (dollar bars with directional flows)
+
+References:
+- Prado AFML Ch. 2.3: Dollar Bars (information-driven sampling)
+- Prado AFML Ch. 2.4: Imbalance Bars (buy/sell flow asymmetry)
+
 """
 
 import json
@@ -29,6 +53,11 @@ VALIDATION_TOKENS_FILE = Path("validation_tokens.json")
 
 # USDC address (used as numeraire, always $1.00)
 USDC_ADDRESS = "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"
+
+# Time delta constants (in seconds)
+MAX_BAR_TIME_DELTA_SEC = 604800  # 7 days - cap for extreme deltas
+ILLIQUIDITY_TIME_THRESHOLD_SEC = 86400  # 1 day - threshold for illiquid tokens
+ILLIQUIDITY_PCT_THRESHOLD = 0.20  # 20% - percent of bars with extreme deltas to filter
 
 # Create Typer app for CLI
 app = typer.Typer(help="Generate pool-level bars with signed net flows.")
@@ -67,9 +96,37 @@ def load_pool_info(pools_file: Path) -> dict[str, dict[str, float | str]]:
     Returns:
         Dictionary mapping pool_address -> {fee, token0, token1}.
 
+    Raises:
+        FileNotFoundError: If pools_file doesn't exist.
+        ValueError: If pools.json has invalid structure.
+        json.JSONDecodeError: If pools.json is not valid JSON.
+
     """
-    with pools_file.open() as f:
-        data = json.load(f)
+    if not pools_file.exists():
+        msg = f"Pools file not found: {pools_file}"
+        raise FileNotFoundError(msg)
+
+    try:
+        with pools_file.open() as f:
+            data = json.load(f)
+    except json.JSONDecodeError:
+        logger.exception("Failed to parse pools.json - file may be corrupted")
+        raise
+
+    # Validate structure
+    if not isinstance(data, dict):
+        msg = f"Invalid pools.json structure: expected dict, got {type(data)}"
+        raise TypeError(msg)
+
+    if "data" not in data:
+        msg = "Invalid pools.json structure: missing 'data' key"
+        raise ValueError(msg)
+
+    if not isinstance(data["data"], list):
+        data_type = type(data["data"])
+        msg = f"Invalid pools.json structure: 'data' should be list, got {data_type}"
+        raise TypeError(msg)
+
     pool_info = {}
     all_pools = data.get("data", [])
 
@@ -320,16 +377,17 @@ def generate_pool_bars(  # noqa: C901, PLR0912, PLR0915
     # Check if we generated any bars
     if len(all_bar_rows) == 0:
         logger.error(
-            "No bars were generated! Check your input data and target_usdc_bar_size.",
+            "No bars were generated! Check input data and target_usdc_bar_size.",
         )
-        msg = "No bars generated - possibly target_usdc_bar_size is too large for the data"
+        msg = "No bars generated - target_usdc_bar_size may be too large"
         raise ValueError(msg)
 
     # Create output DataFrame
     output_df = pl.DataFrame(all_bar_rows)
 
     # Ensure flow columns are Float64 (both src and dest should be consistent)
-    # Note: dest_flow can be zero, which causes Polars to infer Int64; we explicitly cast to Float64
+    # Note: dest_flow can be zero, which causes Polars to infer Int64;
+    # we explicitly cast to Float64
     output_df = output_df.with_columns(
         [
             pl.col("src_flow_usdc").cast(pl.Float64),
@@ -339,6 +397,50 @@ def generate_pool_bars(  # noqa: C901, PLR0912, PLR0915
 
     # Sort by timestamp
     output_df = output_df.sort("bar_close_timestamp")
+
+    # Deduplicate bars (same timestamp + pool + tokens)
+    # This can happen if a pool switches flow direction during bar generation
+    logger.info("Deduplicating bars...")
+    rows_before = len(output_df)
+    output_df = output_df.unique(
+        subset=["bar_close_timestamp", "pool_id", "src_token_id", "dest_token_id"],
+        keep="first",
+    )
+    rows_after = len(output_df)
+    if rows_before > rows_after:
+        logger.warning(
+            "Removed %d duplicate bars (%.2f%%)",
+            rows_before - rows_after,
+            ((rows_before - rows_after) / rows_before) * 100,
+        )
+    else:
+        logger.info("No duplicates found")
+
+    # Re-sort after deduplication to ensure ordering
+    output_df = output_df.sort("bar_close_timestamp")
+
+    # Filter out extremely illiquid tokens before capping time deltas
+    # This removes tokens where >20% of bars have extreme time deltas (>1 day)
+    logger.info("Filtering extremely illiquid tokens...")
+    output_df = filter_illiquid_tokens(output_df)
+
+    # Cap bar_time_delta_sec at a reasonable maximum
+    # Extremely long deltas occur for illiquid pools and can skew downstream analysis
+    extreme_deltas = output_df.filter(
+        pl.col("bar_time_delta_sec") > MAX_BAR_TIME_DELTA_SEC,
+    )
+    if len(extreme_deltas) > 0:
+        logger.info(
+            "Capping %d bars with time delta > 7 days (%.2f%%)",
+            len(extreme_deltas),
+            (len(extreme_deltas) / len(output_df)) * 100,
+        )
+        output_df = output_df.with_columns(
+            pl.when(pl.col("bar_time_delta_sec") > MAX_BAR_TIME_DELTA_SEC)
+            .then(MAX_BAR_TIME_DELTA_SEC)
+            .otherwise(pl.col("bar_time_delta_sec"))
+            .alias("bar_time_delta_sec"),
+        )
 
     logger.info("\nBar Statistics:")
     logger.info("  Total messages: %s", f"{len(output_df):,}")
@@ -357,6 +459,9 @@ def generate_pool_bars(  # noqa: C901, PLR0912, PLR0915
     # Analyze coverage of indirect (non-USDC) swaps
     _log_indirect_swap_analysis(prices_file, swaps_file, output_df)
 
+    # Validate output before saving
+    validate_output(output_df)
+
     logger.info("\nSaving to %s...", output_file)
     output_file.parent.mkdir(parents=True, exist_ok=True)
     output_df.write_parquet(output_file)
@@ -365,6 +470,408 @@ def generate_pool_bars(  # noqa: C901, PLR0912, PLR0915
         "Done! Saved %s messages to usdc_bars.parquet",
         f"{len(output_df):,}",
     )
+
+
+def filter_illiquid_tokens(df_bars: pl.DataFrame) -> pl.DataFrame:
+    """Filter out extremely illiquid tokens that have poor data quality.
+
+    Removes tokens where >20% of their bars have extreme time deltas (>1 day).
+    These tokens are too illiquid to provide reliable training signals and
+    often represent scam/honeypot tokens with little real trading value.
+
+    Args:
+        df_bars: DataFrame with generated bars.
+
+    Returns:
+        Filtered DataFrame with illiquid tokens removed.
+
+    """
+    # Analyze source tokens for extreme time deltas
+    extreme_deltas = df_bars.filter(
+        pl.col("bar_time_delta_sec") > ILLIQUIDITY_TIME_THRESHOLD_SEC,
+    )
+
+    src_analysis = (
+        extreme_deltas.group_by("src_token_id")
+        .agg(pl.len().alias("extreme_bars"))
+        .join(
+            df_bars.group_by("src_token_id").agg(pl.len().alias("total_bars")),
+            on="src_token_id",
+        )
+        .with_columns(
+            (pl.col("extreme_bars") / pl.col("total_bars")).alias("pct_extreme"),
+        )
+        .filter(pl.col("pct_extreme") > ILLIQUIDITY_PCT_THRESHOLD)
+    )
+
+    # Also check destination tokens
+    dest_analysis = (
+        extreme_deltas.group_by("dest_token_id")
+        .agg(pl.len().alias("extreme_bars"))
+        .join(
+            df_bars.group_by("dest_token_id").agg(pl.len().alias("total_bars")),
+            on="dest_token_id",
+        )
+        .with_columns(
+            (pl.col("extreme_bars") / pl.col("total_bars")).alias("pct_extreme"),
+        )
+        .filter(pl.col("pct_extreme") > ILLIQUIDITY_PCT_THRESHOLD)
+    )
+
+    # Combine tokens to filter
+    tokens_to_remove = set(src_analysis["src_token_id"].to_list()) | set(
+        dest_analysis["dest_token_id"].to_list(),
+    )
+
+    if len(tokens_to_remove) > 0:
+        logger.info(
+            "Identified %d illiquid tokens (>%.0f%% of bars with time delta > 1 day)",
+            len(tokens_to_remove),
+            ILLIQUIDITY_PCT_THRESHOLD * 100,
+        )
+
+        # Show top 10 most problematic tokens
+        logger.info("  Top 10 most illiquid tokens:")
+        top_illiquid = (
+            src_analysis.sort("pct_extreme", descending=True)
+            .head(10)
+            .join(
+                df_bars.group_by("src_token_id").agg(
+                    [
+                        pl.col("src_price_usdc").mean().alias("avg_price"),
+                        pl.col("src_flow_usdc").abs().sum().alias("total_volume"),
+                    ],
+                ),
+                left_on="src_token_id",
+                right_on="src_token_id",
+            )
+        )
+
+        for row in top_illiquid.iter_rows(named=True):
+            logger.info(
+                "    %s: %.1f%% extreme (avg price: $%.2e, total volume: $%.0f)",
+                row["src_token_id"][:10] + "...",
+                row["pct_extreme"] * 100,
+                row["avg_price"],
+                row["total_volume"],
+            )
+
+        # Filter out bars containing these tokens
+        bars_before = len(df_bars)
+        df_filtered = df_bars.filter(
+            ~pl.col("src_token_id").is_in(tokens_to_remove)
+            & ~pl.col("dest_token_id").is_in(tokens_to_remove),
+        )
+        bars_removed = bars_before - len(df_filtered)
+
+        logger.info(
+            "Removed %d bars (%.2f%%) containing illiquid tokens",
+            bars_removed,
+            (bars_removed / bars_before) * 100,
+        )
+
+        return df_filtered
+
+    logger.info("No extremely illiquid tokens found")
+    return df_bars
+
+
+def validate_output(df_bars: pl.DataFrame) -> None:  # noqa: C901, PLR0912, PLR0915
+    """Validate the output bar dataset for quality issues.
+
+    Performs comprehensive validation including:
+    - Duplicate detection
+    - Null value checks
+    - Timestamp ordering
+    - Time delta ranges
+    - Tick count validation
+    - Flow value validation
+    - Price value validation
+    - Price continuity checks
+    - Pool and token distribution
+
+    Args:
+        df_bars: DataFrame with generated bars.
+
+    """
+    logger.info("")
+    logger.info("=" * 70)
+    logger.info("BAR DATA VALIDATION")
+    logger.info("=" * 70)
+
+    # 1. Check for duplicates
+    logger.info("\n1. Checking for duplicate bars...")
+    dup_count = (
+        df_bars.group_by(
+            ["bar_close_timestamp", "pool_id", "src_token_id", "dest_token_id"],
+        )
+        .agg(pl.len().alias("count"))
+        .filter(pl.col("count") > 1)
+        .shape[0]
+    )
+    if dup_count > 0:
+        dup_pct = (dup_count / len(df_bars)) * 100
+        logger.warning(
+            "  ⚠️ WARN: %d duplicate bars (%.2f%%)",
+            dup_count,
+            dup_pct,
+        )
+    else:
+        logger.info("  ✅ OK: No duplicate bars found")
+
+    # 2. Check for null values
+    logger.info("\n2. Checking for null values...")
+    null_counts = df_bars.null_count()
+    has_nulls = False
+    for col in null_counts.columns:
+        null_count = null_counts[col][0]
+        if null_count > 0:
+            logger.warning("  ⚠️ WARN: %s has %d null values", col, null_count)
+            has_nulls = True
+    if not has_nulls:
+        logger.info("  ✅ OK: No null values found")
+
+    # 3. Check timestamp ordering
+    logger.info("\n3. Checking timestamp ordering...")
+    sorted_check = df_bars["bar_close_timestamp"].is_sorted()
+    if sorted_check:
+        logger.info("  ✅ OK: Timestamps are sorted")
+    else:
+        logger.warning("  ⚠️ WARN: Timestamps not sorted")
+
+    # 4. Validate bar_time_delta_sec
+    logger.info("\n4. Validating bar_time_delta_sec...")
+    time_delta_stats = df_bars.select(
+        [
+            pl.col("bar_time_delta_sec").min().alias("min"),
+            pl.col("bar_time_delta_sec").max().alias("max"),
+            pl.col("bar_time_delta_sec").mean().alias("mean"),
+            pl.col("bar_time_delta_sec").median().alias("median"),
+        ],
+    ).row(0, named=True)
+
+    logger.info(
+        "  Range: [%.1f, %.1f] seconds",
+        time_delta_stats["min"],
+        time_delta_stats["max"],
+    )
+    logger.info(
+        "  Mean: %.1f, Median: %.1f",
+        time_delta_stats["mean"],
+        time_delta_stats["median"],
+    )
+
+    # Max should be reasonable (< 1 day)
+    if time_delta_stats["max"] > ILLIQUIDITY_TIME_THRESHOLD_SEC:
+        max_days = time_delta_stats["max"] / 86400
+        logger.warning(
+            "  ⚠️ WARN: Max time delta (%.1f days) exceeds expected (1 day)",
+            max_days,
+        )
+        # Find bars with extreme time deltas
+        extreme_deltas = df_bars.filter(
+            pl.col("bar_time_delta_sec") > ILLIQUIDITY_TIME_THRESHOLD_SEC,
+        )
+        logger.warning(
+            "    Found %d bars with time delta > 1 day",
+            len(extreme_deltas),
+        )
+        if len(extreme_deltas) > 0:
+            logger.info("    Top 5 pools with extreme time deltas:")
+            pool_delta_summary = (
+                extreme_deltas.group_by("pool_id")
+                .agg(
+                    [
+                        pl.len().alias("count"),
+                        pl.col("bar_time_delta_sec").max().alias("max_delta"),
+                    ],
+                )
+                .sort("max_delta", descending=True)
+            )
+            for row in pool_delta_summary.head(5).iter_rows(named=True):
+                logger.info(
+                    "      %s: %d bars, max delta=%.1f days",
+                    row["pool_id"][:10] + "...",
+                    row["count"],
+                    row["max_delta"] / 86400,
+                )
+    else:
+        logger.info("  ✅ OK: All time deltas within expected range")
+
+    # 5. Validate tick_count
+    logger.info("\n5. Validating tick_count...")
+    tick_stats = df_bars.select(
+        [
+            pl.col("tick_count").min().alias("min"),
+            pl.col("tick_count").max().alias("max"),
+            pl.col("tick_count").mean().alias("mean"),
+            pl.col("tick_count").median().alias("median"),
+        ],
+    ).row(0, named=True)
+
+    logger.info("  Range: [%d, %d]", tick_stats["min"], tick_stats["max"])
+    logger.info("  Mean: %.1f, Median: %.1f", tick_stats["mean"], tick_stats["median"])
+
+    # Check for bars with only 1 tick (might indicate data issues)
+    single_tick = df_bars.filter(pl.col("tick_count") == 1)
+    if len(single_tick) > 0:
+        single_tick_pct = (len(single_tick) / len(df_bars)) * 100
+        logger.info(
+            "  INFO: %d bars (%.2f%%) have only 1 tick",
+            len(single_tick),
+            single_tick_pct,
+        )
+
+    # 6. Validate flow values
+    logger.info("\n6. Validating flow values...")
+    src_flow_stats = df_bars.select(
+        [
+            pl.col("src_flow_usdc").min().alias("min"),
+            pl.col("src_flow_usdc").max().alias("max"),
+            pl.col("src_flow_usdc").mean().alias("mean"),
+        ],
+    ).row(0, named=True)
+
+    dest_flow_stats = df_bars.select(
+        [
+            pl.col("dest_flow_usdc").min().alias("min"),
+            pl.col("dest_flow_usdc").max().alias("max"),
+            pl.col("dest_flow_usdc").mean().alias("mean"),
+        ],
+    ).row(0, named=True)
+
+    logger.info(
+        "  src_flow_usdc: [%.2e, %.2e], mean=%.2e",
+        src_flow_stats["min"],
+        src_flow_stats["max"],
+        src_flow_stats["mean"],
+    )
+    logger.info(
+        "  dest_flow_usdc: [%.2e, %.2e], mean=%.2e",
+        dest_flow_stats["min"],
+        dest_flow_stats["max"],
+        dest_flow_stats["mean"],
+    )
+
+    # Check for all-zero flows (indicates no trading activity)
+    zero_src = df_bars.filter(pl.col("src_flow_usdc") == 0)
+    zero_dest = df_bars.filter(pl.col("dest_flow_usdc") == 0)
+
+    if len(zero_src) > 0:
+        logger.info(
+            "  INFO: %d bars (%.2f%%) have zero src_flow",
+            len(zero_src),
+            (len(zero_src) / len(df_bars)) * 100,
+        )
+
+    if len(zero_dest) > 0:
+        logger.info(
+            "  INFO: %d bars (%.2f%%) have zero dest_flow",
+            len(zero_dest),
+            (len(zero_dest) / len(df_bars)) * 100,
+        )
+        # NOTE: Zero dest_flow is expected when dest_token is USDC
+        # USDC has no price records (it's the numeraire at $1.00)
+        # so net_flow calculations only occur for non-USDC tokens
+
+    # 7. Validate price values
+    logger.info("\n7. Validating price values...")
+    src_price_stats = df_bars.select(
+        [
+            pl.col("src_price_usdc").min().alias("min"),
+            pl.col("src_price_usdc").max().alias("max"),
+        ],
+    ).row(0, named=True)
+
+    dest_price_stats = df_bars.select(
+        [
+            pl.col("dest_price_usdc").min().alias("min"),
+            pl.col("dest_price_usdc").max().alias("max"),
+        ],
+    ).row(0, named=True)
+
+    logger.info(
+        "  src_price_usdc: [%.2e, %.2e]",
+        src_price_stats["min"],
+        src_price_stats["max"],
+    )
+    logger.info(
+        "  dest_price_usdc: [%.2e, %.2e]",
+        dest_price_stats["min"],
+        dest_price_stats["max"],
+    )
+
+    # Check for negative prices
+    neg_src = df_bars.filter(pl.col("src_price_usdc") < 0)
+    neg_dest = df_bars.filter(pl.col("dest_price_usdc") < 0)
+
+    if len(neg_src) > 0 or len(neg_dest) > 0:
+        logger.warning(
+            "  WARN: Found %d bars with negative src price, %d with negative dest",
+            len(neg_src),
+            len(neg_dest),
+        )
+    else:
+        logger.info("  ✅ OK: All prices are non-negative")
+
+    # 8. Validate price continuity
+    logger.info("\n8. Validating price continuity...")
+    # Check for extreme price jumps between consecutive bars for same token
+    # Group by token and check price changes
+    extreme_price_jumps = 0
+    price_jump_threshold = 0.50  # 50% price change
+
+    for token_col, price_col in [
+        ("src_token_id", "src_price_usdc"),
+        ("dest_token_id", "dest_price_usdc"),
+    ]:
+        token_bars = (
+            df_bars.select([token_col, "bar_close_timestamp", price_col])
+            .sort([token_col, "bar_close_timestamp"])
+            .with_columns(
+                [
+                    pl.col(price_col).shift(1).over(token_col).alias("prev_price"),
+                ],
+            )
+            .filter(pl.col("prev_price").is_not_null())
+        )
+
+        # Calculate price change percentage
+        price_changes = token_bars.with_columns(
+            [
+                (
+                    (pl.col(price_col) - pl.col("prev_price")).abs()
+                    / (pl.col("prev_price") + 1e-9)
+                ).alias("pct_change"),
+            ],
+        )
+
+        extreme = price_changes.filter(pl.col("pct_change") > price_jump_threshold)
+        extreme_price_jumps += len(extreme)
+
+    if extreme_price_jumps > 0:
+        logger.warning(
+            "  ⚠️ WARN: Found %d bars with >50%% price change from previous bar",
+            extreme_price_jumps,
+        )
+        logger.warning("    (This may indicate data quality issues or high volatility)")
+    else:
+        logger.info("  ✅ OK: No extreme price jumps detected")
+
+    # 9. Check pool and token distribution
+    logger.info("\n9. Pool and token distribution...")
+    logger.info("  Unique pools: %d", df_bars["pool_id"].n_unique())
+    unique_src_tokens = df_bars["src_token_id"].n_unique()
+    unique_dest_tokens = df_bars["dest_token_id"].n_unique()
+    unique_tokens = set(df_bars["src_token_id"].unique()) | set(
+        df_bars["dest_token_id"].unique(),
+    )
+    logger.info("  Unique tokens (src): %d", unique_src_tokens)
+    logger.info("  Unique tokens (dest): %d", unique_dest_tokens)
+    logger.info("  Unique tokens (combined): %d", len(unique_tokens))
+
+    logger.info("")
+    logger.info("=" * 70)
 
 
 def _log_indirect_swap_analysis(
@@ -445,7 +952,7 @@ def _log_indirect_swap_analysis(
             )
         else:
             logger.info(
-                "  ✓ Some indirect swap pools have bars: %d pools",
+                "  ✅ Some indirect swap pools have bars: %d pools",
                 len(overlap),
             )
 
@@ -482,124 +989,7 @@ def _log_indirect_swap_analysis(
             f"{len(indirect_only):,}",
         )
     elif bars_without_usdc > 0:
-        logger.info("  ✓ Non-USDC token pair bars present: good for TGNN!")
-
-
-def _log_null_checks(df_bars: pl.DataFrame) -> bool:
-    """Log null value checks and return True if nulls found.
-
-    Args:
-        df_bars: DataFrame to check.
-
-    Returns:
-        True if any nulls found, False otherwise.
-
-    """
-    logger.info("=== NULL VALUE CHECKS ===")
-    null_counts = df_bars.null_count()
-    has_nulls = False
-    for col in null_counts.columns:
-        count = null_counts[col][0]
-        if count > 0:
-            logger.warning("  ⚠ %s: %d nulls", col, count)
-            has_nulls = True
-        else:
-            logger.info("  ✓ %s: no nulls", col)
-    return has_nulls
-
-
-def _log_volume_checks(df_bars: pl.DataFrame) -> bool:
-    """Log volume validation checks.
-
-    Args:
-        df_bars: DataFrame to check.
-
-    Returns:
-        True if critical issues found (all zeros or NaN), False otherwise.
-
-    """
-    logger.info("\n=== VOLUME CHECKS ===")
-
-    # Check src flow distribution
-    src_positive = df_bars.filter(pl.col("src_flow_usdc") > 0)
-    src_negative = df_bars.filter(pl.col("src_flow_usdc") < 0)
-    src_zero = df_bars.filter(pl.col("src_flow_usdc") == 0)
-
-    logger.info("  Source flow distribution:")
-    logger.info(
-        "    Positive: %d (%.2f%%)",
-        len(src_positive),
-        len(src_positive) / len(df_bars) * 100,
-    )
-    logger.info(
-        "    Negative: %d (%.2f%%)",
-        len(src_negative),
-        len(src_negative) / len(df_bars) * 100,
-    )
-    logger.info(
-        "    Zero: %d (%.2f%%)",
-        len(src_zero),
-        len(src_zero) / len(df_bars) * 100,
-    )
-
-    # Check dest flow distribution
-    dest_positive = df_bars.filter(pl.col("dest_flow_usdc") > 0)
-    dest_negative = df_bars.filter(pl.col("dest_flow_usdc") < 0)
-    dest_zero = df_bars.filter(pl.col("dest_flow_usdc") == 0)
-
-    logger.info("  Destination flow distribution:")
-    logger.info(
-        "    Positive: %d (%.2f%%)",
-        len(dest_positive),
-        len(dest_positive) / len(df_bars) * 100,
-    )
-    logger.info(
-        "    Negative: %d (%.2f%%)",
-        len(dest_negative),
-        len(dest_negative) / len(df_bars) * 100,
-    )
-    logger.info(
-        "    Zero: %d (%.2f%%)",
-        len(dest_zero),
-        len(dest_zero) / len(df_bars) * 100,
-    )
-
-    # Critical issue: all flows are zero (no trading activity)
-    has_critical_issue = len(src_zero) == len(df_bars) and len(dest_zero) == len(
-        df_bars,
-    )
-    if has_critical_issue:
-        logger.warning("  ⚠ All bars have zero flows (no trading activity)")
-    else:
-        logger.info("  ✓ Trading activity detected in bars")
-
-    return has_critical_issue
-
-
-def _log_price_checks(df_bars: pl.DataFrame) -> bool:
-    """Log price validation checks.
-
-    Args:
-        df_bars: DataFrame to check.
-
-    Returns:
-        True if negative prices found, False otherwise.
-
-    """
-    negative_src_prices = df_bars.filter(pl.col("src_price_usdc") < 0)
-    negative_dest_prices = df_bars.filter(pl.col("dest_price_usdc") < 0)
-    has_negative_prices = len(negative_src_prices) > 0 or len(negative_dest_prices) > 0
-
-    if has_negative_prices:
-        logger.warning(
-            "  ⚠ Found %d bars with negative src prices, %d with negative dest prices",
-            len(negative_src_prices),
-            len(negative_dest_prices),
-        )
-    else:
-        logger.info("  ✓ All prices are non-negative")
-
-    return has_negative_prices
+        logger.info("  ✅ Non-USDC token pair bars present: good for TGNN!")
 
 
 def _log_statistics(df_bars: pl.DataFrame) -> None:
@@ -892,8 +1282,8 @@ def _validate_against_coingecko(
     logger.info("=" * 70)
     logger.info("VALIDATION INTERPRETATION")
     logger.info("=" * 70)
-    logger.info("  - Price correlation > 0.95: prices align ✓")
-    logger.info("  - Price MAPE < 5%%: prices are accurate ✓")
+    logger.info("  - Price correlation > 0.95: prices align ✅")
+    logger.info("  - Price MAPE < 5%%: prices are accurate ✅")
 
 
 def validate_volume_bars(output_file: Path) -> None:
@@ -916,21 +1306,12 @@ def validate_volume_bars(output_file: Path) -> None:
     df_bars = pl.read_parquet(output_file)
     logger.info("Loaded %d bar records for validation", len(df_bars))
 
-    # Internal data quality checks
-    has_nulls = _log_null_checks(df_bars)
-    has_volume_issues = _log_volume_checks(df_bars)
-    has_negative_prices = _log_price_checks(df_bars)
-    _log_statistics(df_bars)
-    _log_summary(df_bars)
-
     # External correlation validation with CoinGecko
     if not VALIDATION_TOKENS_FILE.exists():
-        logger.warning("Validation tokens file not found: %s", VALIDATION_TOKENS_FILE)
-        validation_ok = not (has_nulls or has_volume_issues or has_negative_prices)
-        if validation_ok:
-            logger.info("\n✓ All internal validation checks passed!")
-        else:
-            logger.warning("\n⚠ Some internal validation checks failed")
+        logger.warning(
+            "Validation tokens file not found: %s (skipping CoinGecko validation)",
+            VALIDATION_TOKENS_FILE,
+        )
         return
 
     with VALIDATION_TOKENS_FILE.open() as f:
@@ -943,28 +1324,15 @@ def validate_volume_bars(output_file: Path) -> None:
 
     if not tokens_to_validate:
         logger.warning(
-            "No tokens with coingecko_id found in %s",
+            "No tokens with coingecko_id found in %s (skipping validation)",
             VALIDATION_TOKENS_FILE,
         )
-        validation_ok = not (has_nulls or has_volume_issues or has_negative_prices)
-        if validation_ok:
-            logger.info("\n✓ All internal validation checks passed!")
-        else:
-            logger.warning("\n⚠ Some internal validation checks failed")
         return
 
-    logger.info(
-        "\n=== COINGECKO CORRELATION VALIDATION ===",
-    )
+    logger.info("\n=== COINGECKO CORRELATION VALIDATION ===")
     logger.info("Validating %d tokens against CoinGecko...", len(tokens_to_validate))
 
     _validate_against_coingecko(df_bars, tokens_to_validate)
-
-    validation_ok = not (has_nulls or has_volume_issues or has_negative_prices)
-    if validation_ok:
-        logger.info("\n✓ All validation checks passed!")
-    else:
-        logger.warning("\n⚠ Some validation checks failed")
 
 
 @app.command()

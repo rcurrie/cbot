@@ -1,21 +1,51 @@
-"""Daily sliding backtest for TGCN token price predictions on DEX swaps.
+"""Temporal Graph Convolutional Network (TGCN) trader with daily sliding backtest.
 
-Daily Trading Cycle:
-1. Train on 5 days of data up to 9am on trade day
-2. Predict top 5 tokens to go long at 9am
-3. Trade from 9am to 5pm
-4. Calculate returns and close positions
-5. Slide forward 1 day and retrain from scratch
+WHY: Traditional time-series models ignore the network effects and contagion
+patterns that dominate crypto markets. Price movements propagate through the token
+graph via swap events - when ETH moves, tokens paired with ETH are affected. TGCN
+captures this by modeling the temporal dynamics of the token swap graph (nodes =
+tokens, edges = swaps).
 
-TGCN Architecture:
-- Nodes: Tokens
-- Edges: Swaps between tokens with temporal and flow information
-- Node labels: Triple-barrier method outputs (up/down/stay predictions)
-- Node features (dynamic): fracdiff, volatility, flow (evolve with each swap)
-- Edge features: flow magnitude (importance weighting)
+This approach combines Prado's rigorous ML methodology (fractional differentiation,
+triple-barrier labeling, concurrency weighting) with graph neural networks to model
+information flow through the DEX ecosystem. We use a sliding backtest where the
+model is retrained daily from scratch to prevent look-ahead bias and simulate real
+trading.
+
+WHAT: Daily sliding backtest implementing:
+1. Train TGCN on 5 days of historical data + morning data (up to 9am)
+2. Predict top N tokens with highest probability of upward movement at 9am
+3. Execute equal-weighted long positions from 9am to 5pm
+4. Apply risk management (stop-loss at -20%, take-profit at +200%)
+5. Calculate returns and slide forward 1 day, retraining from scratch
+6. Aggregate performance metrics: Sharpe ratio, max drawdown, win rate
+
+Binary classification strategy: Model predicts up (invest) vs down (don't invest).
+Original triple-barrier labels (up/stay/down) are merged: stay+up → up (invest),
+down → down (no invest). This focuses the model on avoiding losses.
+
+HOW:
+1. Build temporal graph from labeled bars with bidirectional edges
+2. Node features: fracdiff price, rolling volatility, flow magnitude (dynamic)
+3. Edge features: flow magnitude as attention weights
+4. TGCN architecture: learnable embeddings + feature projection + message passing
+5. Training: Binary cross-entropy with class weights and Prado sample weights
+6. Prediction: Softmax probabilities, invest in tokens with P(up) > 0.5
+7. Returns: Track intraday performance with stop-loss/take-profit exits
+
+INPUT: data/labeled_log_fracdiff_price.parquet (final labeled training data)
+       data/tokens.json (token metadata for display)
+OUTPUT: Console backtest report with daily returns and summary statistics
+
+References:
+- Prado AFML Ch. 3: Triple-Barrier Method and Meta-Labeling
+- Prado AFML Ch. 4: Sample Weights from Label Concurrency
+- Prado AFML Ch. 5: Fractional Differentiation
+- Prado AFML Ch. 7: Cross-Validation for Financial ML
+- TGCN: Temporal Graph Convolutional Networks for message passing on dynamic graphs
+
 """
 
-# %%
 import json
 import logging
 import time
@@ -23,18 +53,23 @@ from datetime import date
 from pathlib import Path
 from typing import Any
 
-import click
 import numpy as np
 import polars as pl
 import torch
+import typer
+from rich.progress import (
+    BarColumn,
+    Progress,
+    SpinnerColumn,
+    TextColumn,
+    TimeRemainingColumn,
+)
 from sklearn.preprocessing import LabelEncoder
 from tgm import DGBatch, DGraph  # type: ignore[import-untyped]
 from tgm.data import DGData, DGDataLoader  # type: ignore[import-untyped]
 from tgm.nn import TGCN, NodePredictor  # type: ignore[import-untyped]
 from torch import nn
-from tqdm import tqdm
 
-# %%
 # Configuration
 logging.basicConfig(
     format="%(asctime)s %(levelname)s %(message)s",
@@ -43,15 +78,13 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Number of '==' characters for logging
-DIVIDER_LENGTH = 40
+# Number of '=' characters for logging (consistent with preprocessing scripts)
+DIVIDER_LENGTH = 70
 
-# Storage locations
-DATA_PATH = Path("data/labeled_log_fracdiff_price.parquet")
-TOKENS_PATH = Path("data/tokens.json")
-
-CHECKPOINT_DIR = Path("data/checkpoints")
-CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
+# Create Typer app for CLI
+app = typer.Typer(
+    help="Daily sliding backtest for TGCN token price predictions.",
+)
 
 # Backtest parameters
 TRAIN_WINDOW_DAYS = 5
@@ -89,13 +122,69 @@ logger.info(
     TRADE_WINDOW_HOURS[1],
 )
 
-# %%
-# Load token metadata from tokens.json
-with TOKENS_PATH.open() as f:
-    tokens_metadata: dict[str, dict[str, Any]] = json.load(f)
+
+def load_token_metadata(tokens_path: Path) -> dict[str, dict[str, Any]]:
+    """Load token metadata from tokens.json.
+
+    Args:
+        tokens_path: Path to tokens.json file.
+
+    Returns:
+        Dictionary mapping token address to metadata.
+
+    """
+    with tokens_path.open() as f:
+        metadata: dict[str, dict[str, Any]] = json.load(f)
+    return metadata
 
 
-# %%
+def validate_input_data(data_path: Path) -> None:
+    """Validate input data exists and meets basic requirements.
+
+    Args:
+        data_path: Path to the parquet file with labeled bars.
+
+    """
+    logger.info("=" * DIVIDER_LENGTH)
+    logger.info("INPUT DATA VALIDATION")
+    logger.info("=" * DIVIDER_LENGTH)
+
+    if not data_path.exists():
+        logger.error("  ❌ ERROR: Input file not found: %s", data_path)
+        msg = f"Input file not found: {data_path}"
+        raise FileNotFoundError(msg)
+
+    logger.info("  ✅ OK: Input file exists: %s", data_path)
+
+    # Quick read to check basic structure
+    df = pl.read_parquet(data_path)
+    required_cols = [
+        "bar_close_timestamp",
+        "src_token_id",
+        "dest_token_id",
+        "src_fracdiff",
+        "dest_fracdiff",
+        "label",
+        "dest_label",
+        "sample_weight",
+        "dest_sample_weight",
+    ]
+
+    missing_cols = [col for col in required_cols if col not in df.columns]
+    if missing_cols:
+        logger.error("  ❌ ERROR: Missing required columns: %s", missing_cols)
+        msg = f"Missing required columns: {missing_cols}"
+        raise ValueError(msg)
+
+    logger.info("  ✅ OK: All required columns present")
+    logger.info(
+        "  ℹ️ Dataset shape: %s rows x %d columns",
+        f"{df.shape[0]:,}",
+        df.shape[1],
+    )
+    logger.info("=" * DIVIDER_LENGTH)
+
+
 def load_and_filter_bars(data_path: Path) -> pl.DataFrame:
     """Load and filter swap bar data.
 
@@ -149,7 +238,6 @@ def load_and_filter_bars(data_path: Path) -> pl.DataFrame:
     return df
 
 
-# %%
 def prepare_data(
     df: pl.DataFrame,
 ) -> tuple[pl.DataFrame, LabelEncoder, int, pl.DataFrame]:
@@ -206,7 +294,6 @@ def prepare_data(
     return df, le, num_tokens, unique_dates
 
 
-# %%
 # Model architecture
 class TokenPredictorModel(nn.Module):
     """TGCN encoder + decoder for token price movement prediction.
@@ -281,9 +368,8 @@ class TokenPredictorModel(nn.Module):
             logits: [num_nodes_in_batch, output_dim] or None if no nodes.
 
         """
-        # Extract node features from dynamic_node_feats
-        # dynamic_node_feats[:, 0:3] = [fracdiff, volatility, flow]
-        # dynamic_node_feats[:, 3:5] = [label, weight] (used for training)
+        # Extract node features: [fracdiff, volatility, flow]
+        # Labels and weights ([:, 3:5]) are used during training
         node_features = batch.dynamic_node_feats[:, :3]
 
         # Project node features to embedding space
@@ -391,17 +477,27 @@ def build_window(
     # Binary classification: merge stay into up (0 or 1 -> 1 for up, -1 -> 0 for down)
     # Original labels: -1=down, 0=stay, 1=up
     # New binary labels: 0=down (no invest), 1=up (consider invest)
-    # Fill null with -999 to mark unlabeled nodes
+    # Fill null with -999 to mark unlabeled nodes (cleaned upstream in pipeline)
 
-    # Src token labels
+    # Src token labels (always present after pipeline filtering)
     raw_src_labels = df_window["label"].fill_null(-999).to_numpy().astype(np.int64)
-    src_labels = np.where(raw_src_labels == -999, -999, np.where(raw_src_labels >= 0, 1, 0))
+    src_labels = np.where(
+        raw_src_labels == -999,
+        -999,
+        np.where(raw_src_labels >= 0, 1, 0),
+    )
     src_weights = df_window["sample_weight"].to_numpy()
 
-    # Dest token labels (NEW: Issue 3 fix)
-    raw_dest_labels = df_window["dest_label"].fill_null(-999).to_numpy().astype(np.int64)
-    dest_labels = np.where(raw_dest_labels == -999, -999, np.where(raw_dest_labels >= 0, 1, 0))
-    dest_weights = df_window["dest_sample_weight"].to_numpy()
+    # Dest token labels (may be null - not all dest tokens have labels)
+    raw_dest_labels = (
+        df_window["dest_label"].fill_null(-999).to_numpy().astype(np.int64)
+    )
+    dest_labels = np.where(
+        raw_dest_labels == -999,
+        -999,
+        np.where(raw_dest_labels >= 0, 1, 0),
+    )
+    dest_weights = df_window["dest_sample_weight"].fill_null(0.0).to_numpy()
 
     # Each swap event updates TWO nodes: src and dest
     # We create 2 node updates per edge event
@@ -411,7 +507,7 @@ def build_window(
     node_ids[1::2] = dst  # Odd indices: dest tokens
 
     # Dynamic node features: [fracdiff, volatility, flow, label, weight]
-    # Shape: [num_events * 2, 5]
+    # Array shape will be [num_events * 2, 5] for src and dest nodes
     dynamic_node_feats = np.zeros((num_events * 2, 5), dtype=np.float32)
 
     # Src node updates (even indices)
@@ -457,31 +553,22 @@ def build_window(
     )
 
 
-# %%
-def train_model(
-    model: TokenPredictorModel,
-    data: DGData,
+def compute_class_weights(
+    loader: DGDataLoader,
     device: str,
-    epochs: int = 1,
-) -> None:
-    """Train model with Prado concurrency weighting.
+) -> tuple[torch.Tensor, dict[int, int]]:
+    """Compute class weights from label distribution.
 
     Args:
-        model: TokenPredictorModel instance.
-        data: DGData with training events.
-        device: Device for training.
-        epochs: Number of epochs (default 1 for sliding backtest).
+        loader: Data loader to iterate through.
+        device: Device for tensors.
+
+    Returns:
+        Tuple of (class_weights tensor, label_counts dict).
 
     """
-    model.train()
-    dg = DGraph(data, device=device)
-    loader = DGDataLoader(dg, batch_size=BATCH_SIZE, batch_unit=BATCH_UNIT)
-    optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
-
-    # First pass: compute label distribution for class weights
     label_counts = {0: 0, 1: 0}
-    temp_loader = DGDataLoader(dg, batch_size=BATCH_SIZE, batch_unit=BATCH_UNIT)
-    for batch in temp_loader:
+    for batch in loader:
         if batch.src.shape[0] == 0 or batch.node_ids is None:
             continue
         batch.dynamic_node_feats = batch.dynamic_node_feats.to(device)
@@ -498,90 +585,215 @@ def train_model(
         for i in range(NUM_CLASSES):
             if label_counts[i] > 0:
                 class_weights[i] = total / (NUM_CLASSES * label_counts[i])
-        print(
-            f"Class weights: Down={class_weights[0]:.2f}, Up={class_weights[1]:.2f}",
+        logger.info(
+            "Class weights: Down=%.2f, Up=%.2f",
+            class_weights[0],
+            class_weights[1],
         )
+
+    return class_weights, label_counts
+
+
+def move_batch_to_device(batch: DGBatch, device: str) -> DGBatch:
+    """Move all batch tensors to specified device.
+
+    Args:
+        batch: Batch to move.
+        device: Target device.
+
+    Returns:
+        Batch with tensors on device.
+
+    """
+    batch.src = batch.src.to(device)
+    batch.dst = batch.dst.to(device)
+    batch.time = batch.time.to(device)
+    edge_index = torch.stack([batch.src, batch.dst], dim=0)
+    batch.edge_index = edge_index
+    batch.edge_feats = batch.edge_feats.to(device)
+    batch.dynamic_node_feats = batch.dynamic_node_feats.to(device)
+    batch.node_ids = batch.node_ids.to(device)
+    return batch
+
+
+def train_model(
+    model: TokenPredictorModel,
+    data: DGData,
+    device: str,
+    epochs: int = 1,
+    patience: int = 3,
+    min_delta: float = 0.001,
+) -> None:
+    """Train model with Prado concurrency weighting and early stopping.
+
+    Args:
+        model: TokenPredictorModel instance.
+        data: DGData with training events.
+        device: Device for training.
+        epochs: Maximum number of epochs (default 1 for sliding backtest).
+        patience: Number of epochs to wait for improvement before stopping.
+        min_delta: Minimum change in loss to qualify as improvement.
+
+    """
+    model.train()
+    dg = DGraph(data, device=device)
+    loader = DGDataLoader(dg, batch_size=BATCH_SIZE, batch_unit=BATCH_UNIT)
+    optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
+
+    # Compute class weights from label distribution
+    temp_loader = DGDataLoader(dg, batch_size=BATCH_SIZE, batch_unit=BATCH_UNIT)
+    class_weights, label_counts = compute_class_weights(temp_loader, device)
 
     criterion = nn.CrossEntropyLoss(weight=class_weights, reduction="none")
 
     # Track overall training statistics
     overall_start_time = time.time()
-    overall_first_loss = None
+    first_epoch_avg_loss = None
     overall_final_loss = None
+    total_batches = sum(1 for _ in loader)
 
-    for epoch in range(epochs):
-        total_loss = 0.0
-        num_batches = 0
-        epoch_first_loss = None
+    # Early stopping tracking
+    best_loss = float("inf")
+    epochs_without_improvement = 0
+    stopped_early = False
 
-        pbar = tqdm(loader, desc=f"Epoch {epoch + 1}/{epochs}", leave=False)
-        for batch in pbar:
-            if batch.src.shape[0] == 0 or batch.node_ids is None:
-                continue
+    # Create nested progress bars: one for epochs, one for current epoch batches
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+        TimeRemainingColumn(),
+    ) as progress:
+        epoch_task = progress.add_task(
+            f"Training (0/{epochs} epochs)",
+            total=epochs,
+        )
+        batch_task = progress.add_task(
+            "Processing batches",
+            total=total_batches,
+        )
 
-            batch.src = batch.src.to(device)
-            batch.dst = batch.dst.to(device)
-            batch.time = batch.time.to(device)
-            edge_index = torch.stack([batch.src, batch.dst], dim=0)
-            batch.edge_index = edge_index
+        for epoch in range(epochs):
+            total_loss = 0.0
+            num_batches = 0
 
-            # Move features to device
-            batch.edge_feats = batch.edge_feats.to(device)
-            batch.dynamic_node_feats = batch.dynamic_node_feats.to(device)
-            batch.node_ids = batch.node_ids.to(device)
+            # Reset batch progress for new epoch
+            progress.reset(
+                batch_task,
+                description=f"Epoch {epoch + 1}/{epochs}",
+                total=total_batches,
+            )
 
-            optimizer.zero_grad()
-            logits = model(batch)
+            for batch_data in loader:
+                if batch_data.src.shape[0] == 0 or batch_data.node_ids is None:
+                    progress.update(batch_task, advance=1)
+                    continue
 
-            if logits is None:
-                continue
+                move_batch_to_device(batch_data, device)
 
-            # Extract labels and weights from dynamic_node_feats
-            # Only use nodes with labels (exclude -999 marker for unlabeled dest tokens)
-            # Binary labels: 0=down (no invest), 1=up (consider invest)
-            has_label = batch.dynamic_node_feats[:, 3] != -999
-            y_true = batch.dynamic_node_feats[has_label, 3].long()
-            batch_weights = batch.dynamic_node_feats[has_label, 4].float()
+                optimizer.zero_grad()
+                logits = model(batch_data)
 
-            loss_per_node = criterion(logits, y_true)
-            weighted_loss = (loss_per_node * batch_weights).mean()
+                if logits is None:
+                    progress.update(batch_task, advance=1)
+                    continue
 
-            weighted_loss.backward()
-            optimizer.step()
+                # Extract labels and weights
+                # Binary labels: 0=down (no invest), 1=up (consider invest)
+                has_label = batch_data.dynamic_node_feats[:, 3] != -999
+                y_true = batch_data.dynamic_node_feats[has_label, 3].long()
+                batch_weights = batch_data.dynamic_node_feats[has_label, 4].float()
 
-            total_loss += weighted_loss.item()
-            num_batches += 1
+                loss_per_node = criterion(logits, y_true)
+                weighted_loss = (loss_per_node * batch_weights).mean()
 
-            # Track first loss across all epochs
-            if overall_first_loss is None:
-                overall_first_loss = weighted_loss.item()
+                weighted_loss.backward()
+                optimizer.step()
 
-            # Track first loss for this epoch
-            if epoch_first_loss is None:
-                epoch_first_loss = weighted_loss.item()
+                total_loss += weighted_loss.item()
+                num_batches += 1
 
-            # Update progress bar with current loss (inline)
-            current_loss = weighted_loss.item()
-            pbar.set_postfix({"loss": f"{current_loss:.4f}"})
+                progress.update(batch_task, advance=1)
 
-        # Track final loss after last epoch
-        if num_batches > 0:
-            overall_final_loss = total_loss / num_batches
+            # Calculate average epoch loss
+            if num_batches > 0:
+                epoch_avg_loss = total_loss / num_batches
+                overall_final_loss = epoch_avg_loss
 
-    # Print summary after all epochs complete
+                # Track first epoch average for comparison
+                if first_epoch_avg_loss is None:
+                    first_epoch_avg_loss = epoch_avg_loss
+
+                # Check for improvement
+                if epoch_avg_loss < best_loss - min_delta:
+                    best_loss = epoch_avg_loss
+                    epochs_without_improvement = 0
+                else:
+                    epochs_without_improvement += 1
+
+                # Early stopping check
+                if epochs_without_improvement >= patience:
+                    stopped_early = True
+                    progress.update(
+                        epoch_task,
+                        advance=epoch + 1,
+                        description=f"Early stop at {epoch + 1}/{epochs} epochs",
+                    )
+                    break
+
+            # Update epoch progress
+            loss_str = f"{epoch_avg_loss:.4f}"
+            epoch_desc = f"Training ({epoch + 1}/{epochs} epochs, loss: {loss_str})"
+            progress.update(
+                epoch_task,
+                advance=1,
+                description=epoch_desc,
+            )
+
+    # Log summary after training complete
     overall_time = time.time() - overall_start_time
-    start_loss = overall_first_loss if overall_first_loss is not None else 0.0
+    start_loss = first_epoch_avg_loss if first_epoch_avg_loss is not None else 0.0
     end_loss = overall_final_loss if overall_final_loss is not None else 0.0
     total_labels = sum(label_counts.values())
-    print(
-        f"Training completed in {overall_time:.2f}s - "
-        f"Start loss: {start_loss:.4f}, End loss: {end_loss:.4f}",
-    )
+
+    stop_reason = "early stopped" if stopped_early else "completed"
+
+    # Check if loss increased overall (warning sign)
+    has_valid_losses = start_loss > 0 and end_loss > 0
+    loss_increased = end_loss > start_loss if has_valid_losses else False
+
+    if loss_increased:
+        logger.warning(
+            "⚠️  Training %s in %.2fs - Loss INCREASED: %.4f → %.4f (Best: %.4f)",
+            stop_reason,
+            overall_time,
+            start_loss,
+            end_loss,
+            best_loss,
+        )
+        logger.warning(
+            "    This suggests the model is unstable or learning rate is too high!",
+        )
+    else:
+        logger.info(
+            "Training %s in %.2fs - Start loss: %.4f, End loss: %.4f, Best loss: %.4f",
+            stop_reason,
+            overall_time,
+            start_loss,
+            end_loss,
+            best_loss,
+        )
+
     if total_labels > 0:
-        print(
-            f"Label distribution - Down: {label_counts[0]} "
-            f"({label_counts[0]/total_labels*100:.1f}%), "
-            f"Up: {label_counts[1]} ({label_counts[1]/total_labels*100:.1f}%)",
+        down_pct = label_counts[0] / total_labels * 100
+        up_pct = label_counts[1] / total_labels * 100
+        logger.info(
+            "Label distribution - Down: %d (%.1f%%), Up: %d (%.1f%%)",
+            label_counts[0],
+            down_pct,
+            label_counts[1],
+            up_pct,
         )
 
 
@@ -611,40 +823,51 @@ def predict_top_tokens(
 
     # Store probabilities instead of hard predictions for more robust confidence
     token_probabilities: dict[int, list[float]] = {}
+    total_batches = sum(1 for _ in loader)
 
-    with torch.no_grad():
-        for batch in tqdm(loader, desc="Predict", leave=False):
-            if batch.src.shape[0] == 0 or batch.node_ids is None:
-                continue
+    with (
+        torch.no_grad(),
+        Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+            TimeRemainingColumn(),
+        ) as progress,
+    ):
+            task = progress.add_task("Predicting token movements", total=total_batches)
 
-            batch.src = batch.src.to(device)
-            batch.dst = batch.dst.to(device)
-            batch.time = batch.time.to(device)
-            edge_index = torch.stack([batch.src, batch.dst], dim=0)
-            batch.edge_index = edge_index
+            for batch_data in loader:
+                if batch_data.src.shape[0] == 0 or batch_data.node_ids is None:
+                    progress.update(task, advance=1)
+                    continue
 
-            # Move features to device
-            batch.edge_feats = batch.edge_feats.to(device)
-            batch.dynamic_node_feats = batch.dynamic_node_feats.to(device)
-            batch.node_ids = batch.node_ids.to(device)
+                move_batch_to_device(batch_data, device)
 
-            logits = model(batch)
-            if logits is None:
-                continue
+                logits = model(batch_data)
+                if logits is None:
+                    progress.update(task, advance=1)
+                    continue
 
-            # Convert logits to probabilities using softmax
-            probs = torch.softmax(logits, dim=1)
-            # Extract probability of "up" class (index 1 in binary classification)
-            up_probs = probs[:, LABEL_UP].cpu().numpy()
+                # Convert logits to probabilities using softmax
+                probs = torch.softmax(logits, dim=1)
+                # Extract probability of "up" class (index 1 in binary classification)
+                up_probs = probs[:, LABEL_UP].cpu().numpy()
 
-            # Get node_ids for labeled nodes only (exclude -999 marker for unlabeled dest tokens)
-            has_label = batch.dynamic_node_feats[:, 3] != -999
-            labeled_node_ids = batch.node_ids[has_label].cpu().numpy()
+                # Get node_ids for labeled nodes only
+                has_label = batch_data.dynamic_node_feats[:, 3] != -999
+                labeled_node_ids = batch_data.node_ids[has_label].cpu().numpy()
 
-            for node_id, prob in zip(labeled_node_ids, up_probs):
-                if node_id not in token_probabilities:
-                    token_probabilities[node_id] = []
-                token_probabilities[node_id].append(prob)
+                for node_id, prob in zip(
+                    labeled_node_ids,
+                    up_probs,
+                    strict=True,
+                ):
+                    if node_id not in token_probabilities:
+                        token_probabilities[node_id] = []
+                    token_probabilities[node_id].append(prob)
+
+                progress.update(task, advance=1)
 
     recommendations: list[tuple[str, float]] = []
     for node_id, prob_list in token_probabilities.items():
@@ -781,40 +1004,72 @@ def compute_backtest_summary(results: list[dict]) -> None:
     best_day_date = results[best_day_idx]["trade_date"]
     worst_day_date = results[worst_day_idx]["trade_date"]
 
+    logger.info("")
+    logger.info("=" * DIVIDER_LENGTH)
     logger.info("BACKTEST SUMMARY")
     logger.info("=" * DIVIDER_LENGTH)
-    logger.info("Total trading days: %d", len(results))
+    logger.info("  ℹ️ Total trading days: %d", len(results))
+    logger.info("")
     logger.info("=" * DIVIDER_LENGTH)
     logger.info("RETURNS SUMMARY")
     logger.info("=" * DIVIDER_LENGTH)
-    logger.info("Total Return: %+.2f%%", total_return * 100)
-    logger.info("Cumulative Return: %+.2f%%", cumulative_return * 100)
-    logger.info("Mean Daily Return: %+.2f%%", mean_return * 100)
-    logger.info("Std Dev: %.2f%%", std_return * 100)
-    logger.info("Sharpe Ratio (annualized): %.2f", sharpe_ratio)
+
+    # Determine return performance status
+    return_icon = "✅" if total_return > 0 else "❌" if total_return < 0 else "⚠️"
+    logger.info("  %s Total Return: %+.2f%%", return_icon, total_return * 100)
+    logger.info("  ℹ️ Cumulative Return: %+.2f%%", cumulative_return * 100)
+    logger.info("  ℹ️ Mean Daily Return: %+.2f%%", mean_return * 100)
+    logger.info("  ℹ️ Std Dev: %.2f%%", std_return * 100)
+
+    # Sharpe ratio status
+    sharpe_icon = "✅" if sharpe_ratio > 1.0 else "⚠️" if sharpe_ratio > 0 else "❌"
+    logger.info("  %s Sharpe Ratio (annualized): %.2f", sharpe_icon, sharpe_ratio)
+
+    logger.info("")
     logger.info("=" * DIVIDER_LENGTH)
     logger.info("WIN/LOSS STATISTICS")
     logger.info("=" * DIVIDER_LENGTH)
+
+    # Win rate status
+    win_rate_icon = "✅" if win_rate > 0.5 else "⚠️" if win_rate > 0.4 else "❌"
     logger.info(
-        "Winning Days: %d / %d (%.1f%%)",
+        "  %s Winning Days: %d / %d (%.1f%%)",
+        win_rate_icon,
         winning_days,
         len(results),
         win_rate * 100,
     )
-    logger.info("Losing Days: %d", losing_days)
+    logger.info("  ℹ️ Losing Days: %d", losing_days)
     logger.info(
-        "Break-even Days: %d",
+        "  ℹ️ Break-even Days: %d",
         len(results) - winning_days - losing_days,
     )
+
+    logger.info("")
     logger.info("=" * DIVIDER_LENGTH)
     logger.info("DRAWDOWN ANALYSIS")
     logger.info("=" * DIVIDER_LENGTH)
-    logger.info("Max Drawdown: %.2f%%", max_drawdown * 100)
+
+    # Drawdown status
+    dd_icon = "✅" if max_drawdown > -0.1 else "⚠️" if max_drawdown > -0.2 else "❌"
+    logger.info("  %s Max Drawdown: %.2f%%", dd_icon, max_drawdown * 100)
+
+    logger.info("")
     logger.info("=" * DIVIDER_LENGTH)
     logger.info("EXTREME DAYS")
     logger.info("=" * DIVIDER_LENGTH)
-    logger.info("Best Day: %s (%+.2f%%)", best_day_date, best_day_return * 100)
-    logger.info("Worst Day: %s (%+.2f%%)", worst_day_date, worst_day_return * 100)
+    logger.info("  ℹ️ Best Day: %s (%+.2f%%)", best_day_date, best_day_return * 100)
+    logger.info("  ℹ️ Worst Day: %s (%+.2f%%)", worst_day_date, worst_day_return * 100)
+    logger.info("=" * DIVIDER_LENGTH)
+
+    # Overall assessment
+    logger.info("")
+    if total_return > 0 and sharpe_ratio > 1.0 and win_rate > 0.5:
+        logger.info("✅ Strategy shows strong performance!")
+    elif total_return > 0:
+        logger.info("⚠️  Strategy is profitable but could be improved")
+    else:
+        logger.info("❌ Strategy underperformed - needs adjustment")
     logger.info("=" * DIVIDER_LENGTH)
 
 
@@ -823,6 +1078,7 @@ def backtest_slide(
     le: LabelEncoder,
     num_tokens: int,
     unique_dates: pl.DataFrame,
+    tokens_metadata: dict[str, dict[str, Any]],
     epochs: int,
     trading_days: int | None = None,
 ) -> None:
@@ -840,6 +1096,7 @@ def backtest_slide(
         le: LabelEncoder for token IDs.
         num_tokens: Total number of unique tokens.
         unique_dates: DataFrame with unique trade dates.
+        tokens_metadata: Dictionary mapping token address to metadata.
         epochs: Number of training epochs per day.
         trading_days: Number of days to trade (None = all available days).
 
@@ -1008,34 +1265,63 @@ def backtest_slide(
     compute_backtest_summary(results)
 
 
-@click.command()
-@click.option(
-    "--epochs",
-    default=10,
-    type=int,
-    help="Number of training epochs per day (default: 10)",
-)
-@click.option(
-    "--trading-days",
-    default=None,
-    type=int,
-    help="Number of days to trade (default: all available days)",
-)
-def main(epochs: int, trading_days: int | None) -> None:
+@app.command()
+def main(
+    data_path: Path = typer.Option(
+        Path("data/labeled_log_fracdiff_price.parquet"),
+        "--data",
+        "-d",
+        help="Path to labeled training data parquet file",
+    ),
+    tokens_path: Path = typer.Option(
+        Path("data/tokens.json"),
+        "--tokens",
+        "-t",
+        help="Path to tokens metadata JSON file",
+    ),
+    epochs: int = typer.Option(
+        10,
+        "--epochs",
+        "-e",
+        help="Number of training epochs per day",
+    ),
+    trading_days: int | None = typer.Option(
+        None,
+        "--trading-days",
+        help="Number of days to trade (default: all available)",
+    ),
+) -> None:
     """Run daily sliding backtest for TGCN token predictions.
 
     Each day:
     - Train on 5 days up to 9am
     - Predict top 5 tokens at 9am
     - Trade from 9am to 5pm
-    - Slide forward 1 day and retrain
+    - Slide forward 1 day and retrain from scratch
     """
-    df = load_and_filter_bars(DATA_PATH)
+    # Validate input data
+    validate_input_data(data_path)
+
+    # Load token metadata
+    logger.info("Loading token metadata from %s", tokens_path)
+    tokens_metadata = load_token_metadata(tokens_path)
+    logger.info("Loaded metadata for %d tokens", len(tokens_metadata))
+
+    # Load and prepare data
+    df = load_and_filter_bars(data_path)
     df, le, num_tokens, unique_dates = prepare_data(df)
 
     # Run backtest
-    backtest_slide(df, le, num_tokens, unique_dates, epochs, trading_days)
+    backtest_slide(
+        df,
+        le,
+        num_tokens,
+        unique_dates,
+        tokens_metadata,
+        epochs,
+        trading_days,
+    )
 
 
 if __name__ == "__main__":
-    main()
+    app()

@@ -1,10 +1,10 @@
 # Phase 0: Get swaps and reference data
 ingest-swaps:
-	echo "Ingesting swaps data for July 2025 from Google BigQuery..."
-	python src/ingest-swaps.py \
+	echo "Ingesting swaps data from Google BigQuery..."
+	python src/ingest_swaps.py \
 		--chain ethereum \
-		--start-date 2025-07-01 \
-		--end-date 2025-08-01 \
+		--start-date 2025-12-01 \
+		--end-date 2026-01-01 \
 		--output-dir data/swaps/ \
 		--verbose 
 
@@ -16,7 +16,10 @@ ingest-pools:
 
 
 filter-and-decode-swaps:
-	python src/filter_and_decode_swaps.py --verbose
+	python src/filter_and_decode_swaps.py \
+	--start-date 2025-10-01 \
+	--end-date 2026-01-01 \
+	--verbose
 
 calculate-usdc-prices:
 	python src/calculate_usdc_prices.py --verbose --validate
@@ -30,11 +33,18 @@ make-stationary:
 label-triple-barrier:
 	python src/label_triple_barrier.py --verbose --validate
 
+training-data-validation:
+	python src/training_data_validation.py
 
 
 
-update-train-test-data: filter-and-decode-swaps calculate-usdc-prices generate-usdc-bars make-stationary label-triple-barrier
+update-train-data: filter-and-decode-swaps calculate-usdc-prices generate-usdc-bars make-stationary label-triple-barrier training-data-validation
 
+
+backtest:
+	python src/dex_contagion_trader.py \
+		--epochs 20 \
+		--trading-days 5 
 
 
 

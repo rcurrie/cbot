@@ -1,4 +1,5 @@
 .env
+plots/
 keys/
 data/
 __pycache__/
