@@ -8,21 +8,31 @@ time-homogeneous. This is crucial for ML as each bar represents similar "informa
 content" regardless of calendar time elapsed.
 
 WHAT: Transform swap-level price observations into pool-level dollar bars where:
-1. Bars close when cumulative USDC volume reaches target threshold ($100k default)
+1. Bars close when cumulative USDC volume reaches ADAPTIVE threshold (0.1% daily volume)
 2. Each bar captures signed net flows (buy/sell pressure) for both tokens
 3. Primary flow direction (src → dest) determined by dominant volume
 4. Time delta between bars captures liquidity dynamics
+5. Token-specific thresholds ensure information homogeneity across market caps
+
+**ADAPTIVE BAR SIZING (Phase 1 Improvement)**:
+Unlike fixed $100k thresholds, adaptive bars scale with token liquidity:
+- High-volume tokens (WETH, USDC): Large bars ($200k-$1M) = minutes
+- Low-volume tokens (small-caps): Small bars ($10k-$50k) = hours
+This prevents heterogeneity where USDC bars = noise, small-cap bars = gaps.
 
 This creates a feature-rich representation for temporal graph neural networks, where
 each bar becomes a directed edge in the token graph with flow magnitudes as features.
 
 HOW:
-1. Group price observations by pool and process chronologically
-2. Accumulate USDC volume and signed flows until threshold reached
-3. Calculate bar features: time delta, tick count, net flows, closing prices
-4. Assign src/dest based on which token has larger absolute flow
-5. Filter illiquid tokens (>20% bars with >1 day time delta)
-6. Validate output and optionally compare to CoinGecko ground truth
+1. Calculate token daily volumes from historical data
+2. Set pool threshold = 0.1% of max(token_a_volume, token_b_volume)
+3. Clamp thresholds to [$10k, $1M] for stability
+4. Group price observations by pool and process chronologically
+5. Accumulate USDC volume and signed flows until pool-specific threshold reached
+6. Calculate bar features: time delta, tick count, net flows, closing prices
+7. Assign src/dest based on which token has larger absolute flow
+8. Filter illiquid tokens (>20% bars with >1 day time delta)
+9. Validate output and optionally compare to CoinGecko ground truth
 
 INPUT: data/usdc_priced_swaps.parquet (price time series)
 OUTPUT: data/usdc_bars.parquet (dollar bars with directional flows)
@@ -30,6 +40,7 @@ OUTPUT: data/usdc_bars.parquet (dollar bars with directional flows)
 References:
 - Prado AFML Ch. 2.3: Dollar Bars (information-driven sampling)
 - Prado AFML Ch. 2.4: Imbalance Bars (buy/sell flow asymmetry)
+- Phase 1 Plan: Adaptive thresholds for information homogeneity
 
 """
 
@@ -58,6 +69,12 @@ USDC_ADDRESS = "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"
 MAX_BAR_TIME_DELTA_SEC = 604800  # 7 days - cap for extreme deltas
 ILLIQUIDITY_TIME_THRESHOLD_SEC = 86400  # 1 day - threshold for illiquid tokens
 ILLIQUIDITY_PCT_THRESHOLD = 0.20  # 20% - percent of bars with extreme deltas to filter
+
+# Adaptive bar threshold constants
+DEFAULT_BAR_SIZE = 100_000.0  # Default $100k bar size (fallback)
+ADAPTIVE_BAR_FRACTION = 0.001  # 0.1% of daily volume per bar
+MIN_BAR_SIZE = 10_000.0  # Minimum $10k bar (prevent too-small bars)
+MAX_BAR_SIZE = 1_000_000.0  # Maximum $1M bar (prevent too-large bars)
 
 # Create Typer app for CLI
 app = typer.Typer(help="Generate pool-level bars with signed net flows.")
@@ -143,7 +160,7 @@ def load_pool_info(pools_file: Path) -> dict[str, dict[str, float | str]]:
         pool_addr = pool["address"].lower()
         tokens = pool.get("tokens", [])
 
-        if len(tokens) == 2:  # noqa: PLR2004
+        if len(tokens) == 2:
             pool_info[pool_addr] = {
                 "fee": float(pool.get("fee", 0.003)),
                 "token0": tokens[0]["address"].lower(),
@@ -154,12 +171,109 @@ def load_pool_info(pools_file: Path) -> dict[str, dict[str, float | str]]:
     return pool_info
 
 
+def calculate_token_daily_volumes(prices_df: pl.DataFrame) -> dict[str, float]:
+    """Calculate average daily USDC volume per token across the dataset.
+
+    This provides token-level liquidity statistics used for adaptive bar sizing.
+    Higher volume tokens get larger bar thresholds to maintain information
+    homogeneity across the temporal graph (Prado AFML Ch. 2.3).
+
+    Args:
+        prices_df: DataFrame with token_address and usdc_volume columns.
+
+    Returns:
+        Dictionary mapping token_address -> avg_daily_volume_usdc.
+
+    """
+    logger.info("Calculating token daily volumes for adaptive bar sizing...")
+
+    # Group by token and date, sum volume per day
+    daily_volumes = (
+        prices_df.with_columns(
+            pl.col("block_timestamp").dt.truncate("1d").alias("date"),
+        )
+        .group_by(["token_address", "date"])
+        .agg(pl.col("usdc_volume").sum().alias("daily_volume"))
+    )
+
+    # Calculate average daily volume per token
+    token_avg_volumes = (
+        daily_volumes.group_by("token_address")
+        .agg(pl.col("daily_volume").mean().alias("avg_daily_volume"))
+        .to_dict(as_series=False)
+    )
+
+    # Convert to dictionary
+    volume_map = dict(
+        zip(
+            token_avg_volumes["token_address"],
+            token_avg_volumes["avg_daily_volume"],
+            strict=False,
+        ),
+    )
+
+    # Log statistics
+    volumes = list(volume_map.values())
+    if len(volumes) > 0:
+        logger.info("  Tokens analyzed: %d", len(volumes))
+        logger.info("  Min daily volume: $%s", f"{min(volumes):,.0f}")
+        logger.info("  Max daily volume: $%s", f"{max(volumes):,.0f}")
+        median_vol = sorted(volumes)[len(volumes) // 2]
+        logger.info("  Median daily volume: $%s", f"{median_vol:,.0f}")
+
+    return volume_map
+
+
+def get_adaptive_bar_threshold(
+    token_a: str,
+    token_b: str,
+    token_volumes: dict[str, float],
+) -> float:
+    """Calculate adaptive dollar bar threshold for a pool based on token liquidity.
+
+    Uses token-specific volume to create information-homogeneous bars. High-volume
+    tokens (like WETH) get larger bar thresholds, while low-volume tokens get smaller
+    thresholds. This ensures each bar represents similar "information content"
+    regardless of the token's market cap (Prado AFML Ch. 2.3).
+
+    Formula: threshold = ADAPTIVE_BAR_FRACTION * max(volume_a, volume_b)
+    Clamped to [MIN_BAR_SIZE, MAX_BAR_SIZE] for stability.
+
+    Args:
+        token_a: First token address.
+        token_b: Second token address.
+        token_volumes: Dictionary mapping token_address -> avg_daily_volume.
+
+    Returns:
+        Dollar bar threshold in USDC for this pool.
+
+    """
+    # Get volumes for both tokens (default to 0 if not found)
+    vol_a = token_volumes.get(token_a, 0.0)
+    vol_b = token_volumes.get(token_b, 0.0)
+
+    # Use the higher volume token to determine bar size
+    max_volume = max(vol_a, vol_b)
+
+    if max_volume == 0:
+        # No volume data - use default
+        return DEFAULT_BAR_SIZE
+
+    # Calculate adaptive threshold: 0.1% of daily volume
+    threshold = max_volume * ADAPTIVE_BAR_FRACTION
+
+    # Clamp to reasonable range
+    return max(MIN_BAR_SIZE, min(MAX_BAR_SIZE, threshold))
+
+
+
 def generate_pool_bars(  # noqa: C901, PLR0912, PLR0915
     swaps_file: Path,
     prices_file: Path,
     pools_file: Path,
     output_file: Path,
-    target_usdc_bar_size: float,
+    target_usdc_bar_size: float | None = None,
+    use_adaptive_bars: bool = True,
 ) -> None:
     """Generate pool-level bars with signed net flows.
 
@@ -168,7 +282,10 @@ def generate_pool_bars(  # noqa: C901, PLR0912, PLR0915
         prices_file: Path to usdc_prices_timeseries.parquet.
         pools_file: Path to pools.json.
         output_file: Path to output usdc_bars.parquet.
-        target_usdc_bar_size: Target dollar volume per bar (e.g., 100000 for $100k).
+        target_usdc_bar_size: Fixed dollar volume per bar (e.g., 100000 for $100k).
+            If None and use_adaptive_bars=True, uses adaptive sizing.
+        use_adaptive_bars: If True, calculate adaptive bar thresholds per pool.
+            If False, use target_usdc_bar_size for all pools.
 
     """
     logger.info("Loading pool information...")
@@ -177,6 +294,16 @@ def generate_pool_bars(  # noqa: C901, PLR0912, PLR0915
     logger.info("Loading prices data from %s...", prices_file)
     prices_df = pl.read_parquet(prices_file)
     logger.info("Loaded %s price records", f"{len(prices_df):,}")
+
+    # Calculate token daily volumes for adaptive bar sizing
+    token_volumes: dict[str, float] = {}
+    if use_adaptive_bars:
+        token_volumes = calculate_token_daily_volumes(prices_df)
+        logger.info("✅ Adaptive bar sizing enabled (0.1%% of daily volume per bar)")
+    else:
+        if target_usdc_bar_size is None:
+            target_usdc_bar_size = DEFAULT_BAR_SIZE
+        logger.info("Using fixed bar size: $%s", f"{target_usdc_bar_size:,.0f}")
 
     logger.info("Loading swaps data from %s...", swaps_file)
     swaps_df = pl.read_parquet(swaps_file)
@@ -255,6 +382,8 @@ def generate_pool_bars(  # noqa: C901, PLR0912, PLR0915
     # Group by pool and process each pool separately
     all_bar_rows = []
     pools_processed = 0
+    # Track thresholds per pool for logging
+    adaptive_thresholds_used: dict[str, float] = {}
 
     for pool_id_tuple, pool_data_df in data.group_by("pool", maintain_order=True):
         pools_processed += 1
@@ -270,6 +399,19 @@ def generate_pool_bars(  # noqa: C901, PLR0912, PLR0915
 
         token_a = pool_info[pool_id]["token0"]
         token_b = pool_info[pool_id]["token1"]
+
+        # Type narrowing: ensure tokens are strings
+        assert isinstance(token_a, str)
+        assert isinstance(token_b, str)
+
+        # Determine bar threshold for this pool (adaptive or fixed)
+        if use_adaptive_bars:
+            pool_bar_threshold = get_adaptive_bar_threshold(
+                token_a, token_b, token_volumes,
+            )
+            adaptive_thresholds_used[pool_id] = pool_bar_threshold
+        else:
+            pool_bar_threshold = target_usdc_bar_size or DEFAULT_BAR_SIZE
 
         # Initialize bar accumulation variables
         bar_usdc_volume = 0.0
@@ -289,8 +431,8 @@ def generate_pool_bars(  # noqa: C901, PLR0912, PLR0915
             # Track unique swaps for tick count
             seen_swaps.add(swap_key)
 
-            # Check if bar is complete
-            if bar_usdc_volume >= target_usdc_bar_size:
+            # Check if bar is complete (use pool-specific threshold)
+            if bar_usdc_volume >= pool_bar_threshold:
                 # Bar is complete - generate output rows
                 bar_close_timestamp = row["block_timestamp"]
                 tick_count = len(seen_swaps)
@@ -374,12 +516,45 @@ def generate_pool_bars(  # noqa: C901, PLR0912, PLR0915
         pools_processed,
     )
 
+    # Log adaptive threshold statistics
+    if use_adaptive_bars and len(adaptive_thresholds_used) > 0:
+        thresholds = list(adaptive_thresholds_used.values())
+        logger.info("\n=== ADAPTIVE BAR THRESHOLD STATISTICS ===")
+        logger.info("  Pools with adaptive thresholds: %d", len(thresholds))
+        logger.info("  Min threshold: $%s", f"{min(thresholds):,.0f}")
+        logger.info("  Max threshold: $%s", f"{max(thresholds):,.0f}")
+        median_threshold = sorted(thresholds)[len(thresholds) // 2]
+        logger.info("  Median threshold: $%s", f"{median_threshold:,.0f}")
+        logger.info("  Mean threshold: $%s", f"{sum(thresholds)/len(thresholds):,.0f}")
+
+        # Show distribution
+        small_bars = sum(1 for t in thresholds if t <= 50_000)
+        medium_bars = sum(1 for t in thresholds if 50_000 < t <= 200_000)
+        large_bars = sum(1 for t in thresholds if t > 200_000)
+        total = len(thresholds)
+        logger.info("  Distribution:")
+        logger.info(
+            "    Small bars ($10k-$50k): %d (%.1f%%)",
+            small_bars,
+            small_bars / total * 100,
+        )
+        logger.info(
+            "    Medium bars ($50k-$200k): %d (%.1f%%)",
+            medium_bars,
+            medium_bars / total * 100,
+        )
+        logger.info(
+            "    Large bars ($200k+): %d (%.1f%%)",
+            large_bars,
+            large_bars / total * 100,
+        )
+
     # Check if we generated any bars
     if len(all_bar_rows) == 0:
         logger.error(
-            "No bars were generated! Check input data and target_usdc_bar_size.",
+            "No bars were generated! Check input data and bar sizing parameters.",
         )
-        msg = "No bars generated - target_usdc_bar_size may be too large"
+        msg = "No bars generated - bar threshold may be too large"
         raise ValueError(msg)
 
     # Create output DataFrame
@@ -1357,10 +1532,18 @@ def main(
         "--output-file",
         help="Output parquet file path",
     ),
-    target_usdc_bar_size: float = typer.Option(
-        100000.0,
+    target_usdc_bar_size: float | None = typer.Option(
+        None,
         "--target-usdc-bar-size",
-        help="Target USDC volume per bar (default: $100k)",
+        help=(
+            "Fixed USDC volume per bar (e.g., 100000 for $100k). "
+            "If not specified, uses adaptive sizing."
+        ),
+    ),
+    use_adaptive_bars: bool = typer.Option(
+        True,
+        "--adaptive/--fixed",
+        help="Use adaptive bar sizing (0.1%% daily volume) or fixed size",
     ),
     verbose: bool = typer.Option(
         False,
@@ -1373,7 +1556,15 @@ def main(
         help="Run validation checks on generated bars after generation",
     ),
 ) -> None:
-    """Generate pool-level bars with signed net flows."""
+    """Generate pool-level bars with signed net flows.
+
+    By default, uses ADAPTIVE bar sizing where each pool gets a threshold
+    based on 0.1% of its tokens' daily volume. This creates information-
+    homogeneous bars where high-volume tokens (WETH, USDC) get larger bars
+    and low-volume tokens get smaller bars.
+
+    Use --fixed to disable adaptive sizing and use a constant threshold.
+    """
     logging.basicConfig(
         level=logging.INFO if verbose else logging.WARNING,
         format="%(asctime)s %(levelname)s %(message)s",
@@ -1386,6 +1577,7 @@ def main(
         pools_file,
         output_file,
         target_usdc_bar_size,
+        use_adaptive_bars,
     )
 
     if validate:
