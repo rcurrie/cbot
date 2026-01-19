@@ -57,13 +57,6 @@ import numpy as np
 import polars as pl
 import torch
 import typer
-from rich.progress import (
-    BarColumn,
-    Progress,
-    SpinnerColumn,
-    TextColumn,
-    TimeRemainingColumn,
-)
 from sklearn.preprocessing import LabelEncoder
 from tgm import DGBatch, DGraph  # type: ignore[import-untyped]
 from tgm.data import DGData, DGDataLoader  # type: ignore[import-untyped]
@@ -608,11 +601,57 @@ def move_batch_to_device(batch: DGBatch, device: str) -> DGBatch:
     batch.src = batch.src.to(device)
     batch.dst = batch.dst.to(device)
     batch.time = batch.time.to(device)
-    edge_index = torch.stack([batch.src, batch.dst], dim=0)
-    batch.edge_index = edge_index
     batch.edge_feats = batch.edge_feats.to(device)
     batch.dynamic_node_feats = batch.dynamic_node_feats.to(device)
     batch.node_ids = batch.node_ids.to(device)
+
+    # TGM library provides src/dst as global node IDs, but PyTorch Geometric
+    # expects batch-local indices (0, 1, 2, ...). Map global IDs to positions.
+    # Create mapping from global node ID to batch-local position
+    src_np = batch.src.cpu().numpy()
+    dst_np = batch.dst.cpu().numpy()
+    node_ids_np = batch.node_ids.cpu().numpy()
+
+    node_id_to_pos = {int(nid): i for i, nid in enumerate(node_ids_np)}
+
+    # Filter edges to only include those where both src and dst are in node_ids
+    # Some edges may reference nodes not in this batch
+    valid_edges = []
+    valid_edge_indices = []
+    for i, (s, d) in enumerate(zip(src_np, dst_np, strict=True)):
+        s_int = int(s)
+        d_int = int(d)
+        if s_int in node_id_to_pos and d_int in node_id_to_pos:
+            valid_edges.append((node_id_to_pos[s_int], node_id_to_pos[d_int]))
+            valid_edge_indices.append(i)
+
+    # Build edge_index from valid edges
+    if valid_edges:
+        src_local = torch.tensor(
+            [s for s, _ in valid_edges],
+            device=device,
+            dtype=torch.long,
+        )
+        dst_local = torch.tensor(
+            [d for _, d in valid_edges],
+            device=device,
+            dtype=torch.long,
+        )
+        edge_index = torch.stack([src_local, dst_local], dim=0)
+
+        # Also filter edge_feats to match
+        if len(valid_edge_indices) < len(src_np):
+            indices_tensor = torch.tensor(valid_edge_indices, dtype=torch.long)
+            batch.edge_feats = batch.edge_feats[indices_tensor].to(device)
+    else:
+        # No valid edges in this batch
+        edge_index = torch.zeros((2, 0), device=device, dtype=torch.long)
+        batch.edge_feats = torch.zeros(
+            (0, batch.edge_feats.shape[1]),
+            device=device,
+        )
+
+    batch.edge_index = edge_index
     return batch
 
 
@@ -657,99 +696,84 @@ def train_model(
     epochs_without_improvement = 0
     stopped_early = False
 
-    # Create nested progress bars: one for epochs, one for current epoch batches
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        BarColumn(),
-        TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
-        TimeRemainingColumn(),
-    ) as progress:
-        epoch_task = progress.add_task(
-            f"Training (0/{epochs} epochs)",
-            total=epochs,
-        )
-        batch_task = progress.add_task(
-            "Processing batches",
-            total=total_batches,
-        )
+    # Training loop with periodic progress logging
+    for epoch in range(epochs):
+        total_loss = 0.0
+        num_batches = 0
+        batches_processed = 0
 
-        for epoch in range(epochs):
-            total_loss = 0.0
-            num_batches = 0
+        for batch_data in loader:
+            if batch_data.src.shape[0] == 0 or batch_data.node_ids is None:
+                batches_processed += 1
+                continue
 
-            # Reset batch progress for new epoch
-            progress.reset(
-                batch_task,
-                description=f"Epoch {epoch + 1}/{epochs}",
-                total=total_batches,
+            move_batch_to_device(batch_data, device)
+
+            optimizer.zero_grad()
+            logits = model(batch_data)
+
+            if logits is None:
+                batches_processed += 1
+                continue
+
+            # Extract labels and weights
+            # Binary labels: 0=down (no invest), 1=up (consider invest)
+            has_label = batch_data.dynamic_node_feats[:, 3] != -999
+            y_true = batch_data.dynamic_node_feats[has_label, 3].long()
+            batch_weights = batch_data.dynamic_node_feats[has_label, 4].float()
+
+            loss_per_node = criterion(logits, y_true)
+            weighted_loss = (loss_per_node * batch_weights).mean()
+
+            weighted_loss.backward()
+            optimizer.step()
+
+            total_loss += weighted_loss.item()
+            num_batches += 1
+            batches_processed += 1
+
+            # Log progress every 25% of batches
+            if batches_processed % max(1, total_batches // 4) == 0:
+                pct = int(100 * batches_processed / total_batches)
+                logger.info(
+                    "  Epoch %d/%d: %d%% complete (%d/%d batches)",
+                    epoch + 1,
+                    epochs,
+                    pct,
+                    batches_processed,
+                    total_batches,
+                )
+
+        # Calculate average epoch loss
+        if num_batches > 0:
+            epoch_avg_loss = total_loss / num_batches
+            overall_final_loss = epoch_avg_loss
+
+            # Track first epoch average for comparison
+            if first_epoch_avg_loss is None:
+                first_epoch_avg_loss = epoch_avg_loss
+
+            # Check for improvement
+            if epoch_avg_loss < best_loss - min_delta:
+                best_loss = epoch_avg_loss
+                epochs_without_improvement = 0
+            else:
+                epochs_without_improvement += 1
+
+            # Log epoch completion
+            logger.info(
+                "  Epoch %d/%d complete: loss=%.4f, best=%.4f",
+                epoch + 1,
+                epochs,
+                epoch_avg_loss,
+                best_loss,
             )
 
-            for batch_data in loader:
-                if batch_data.src.shape[0] == 0 or batch_data.node_ids is None:
-                    progress.update(batch_task, advance=1)
-                    continue
-
-                move_batch_to_device(batch_data, device)
-
-                optimizer.zero_grad()
-                logits = model(batch_data)
-
-                if logits is None:
-                    progress.update(batch_task, advance=1)
-                    continue
-
-                # Extract labels and weights
-                # Binary labels: 0=down (no invest), 1=up (consider invest)
-                has_label = batch_data.dynamic_node_feats[:, 3] != -999
-                y_true = batch_data.dynamic_node_feats[has_label, 3].long()
-                batch_weights = batch_data.dynamic_node_feats[has_label, 4].float()
-
-                loss_per_node = criterion(logits, y_true)
-                weighted_loss = (loss_per_node * batch_weights).mean()
-
-                weighted_loss.backward()
-                optimizer.step()
-
-                total_loss += weighted_loss.item()
-                num_batches += 1
-
-                progress.update(batch_task, advance=1)
-
-            # Calculate average epoch loss
-            if num_batches > 0:
-                epoch_avg_loss = total_loss / num_batches
-                overall_final_loss = epoch_avg_loss
-
-                # Track first epoch average for comparison
-                if first_epoch_avg_loss is None:
-                    first_epoch_avg_loss = epoch_avg_loss
-
-                # Check for improvement
-                if epoch_avg_loss < best_loss - min_delta:
-                    best_loss = epoch_avg_loss
-                    epochs_without_improvement = 0
-                else:
-                    epochs_without_improvement += 1
-
-                # Early stopping check
-                if epochs_without_improvement >= patience:
-                    stopped_early = True
-                    progress.update(
-                        epoch_task,
-                        advance=epoch + 1,
-                        description=f"Early stop at {epoch + 1}/{epochs} epochs",
-                    )
-                    break
-
-            # Update epoch progress
-            loss_str = f"{epoch_avg_loss:.4f}"
-            epoch_desc = f"Training ({epoch + 1}/{epochs} epochs, loss: {loss_str})"
-            progress.update(
-                epoch_task,
-                advance=1,
-                description=epoch_desc,
-            )
+            # Early stopping check
+            if epochs_without_improvement >= patience:
+                stopped_early = True
+                logger.info("  Early stopping triggered after %d epochs", epoch + 1)
+                break
 
     # Log summary after training complete
     overall_time = time.time() - overall_start_time
@@ -825,49 +849,50 @@ def predict_top_tokens(
     token_probabilities: dict[int, list[float]] = {}
     total_batches = sum(1 for _ in loader)
 
-    with (
-        torch.no_grad(),
-        Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            BarColumn(),
-            TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
-            TimeRemainingColumn(),
-        ) as progress,
-    ):
-            task = progress.add_task("Predicting token movements", total=total_batches)
+    # Prediction loop with periodic progress logging
+    batches_processed = 0
+    with torch.no_grad():
+        for batch_data in loader:
+            if batch_data.src.shape[0] == 0 or batch_data.node_ids is None:
+                batches_processed += 1
+                continue
 
-            for batch_data in loader:
-                if batch_data.src.shape[0] == 0 or batch_data.node_ids is None:
-                    progress.update(task, advance=1)
-                    continue
+            move_batch_to_device(batch_data, device)
 
-                move_batch_to_device(batch_data, device)
+            logits = model(batch_data)
+            if logits is None:
+                batches_processed += 1
+                continue
 
-                logits = model(batch_data)
-                if logits is None:
-                    progress.update(task, advance=1)
-                    continue
+            # Convert logits to probabilities using softmax
+            probs = torch.softmax(logits, dim=1)
+            # Extract probability of "up" class (index 1 in binary classification)
+            up_probs = probs[:, LABEL_UP].cpu().numpy()
 
-                # Convert logits to probabilities using softmax
-                probs = torch.softmax(logits, dim=1)
-                # Extract probability of "up" class (index 1 in binary classification)
-                up_probs = probs[:, LABEL_UP].cpu().numpy()
+            # Get node_ids for labeled nodes only
+            has_label = batch_data.dynamic_node_feats[:, 3] != -999
+            labeled_node_ids = batch_data.node_ids[has_label].cpu().numpy()
 
-                # Get node_ids for labeled nodes only
-                has_label = batch_data.dynamic_node_feats[:, 3] != -999
-                labeled_node_ids = batch_data.node_ids[has_label].cpu().numpy()
+            for node_id, prob in zip(
+                labeled_node_ids,
+                up_probs,
+                strict=True,
+            ):
+                if node_id not in token_probabilities:
+                    token_probabilities[node_id] = []
+                token_probabilities[node_id].append(prob)
 
-                for node_id, prob in zip(
-                    labeled_node_ids,
-                    up_probs,
-                    strict=True,
-                ):
-                    if node_id not in token_probabilities:
-                        token_probabilities[node_id] = []
-                    token_probabilities[node_id].append(prob)
+            batches_processed += 1
 
-                progress.update(task, advance=1)
+            # Log progress every 25% of batches
+            if batches_processed % max(1, total_batches // 4) == 0:
+                pct = int(100 * batches_processed / total_batches)
+                logger.info(
+                    "  Prediction: %d%% complete (%d/%d batches)",
+                    pct,
+                    batches_processed,
+                    total_batches,
+                )
 
     recommendations: list[tuple[str, float]] = []
     for node_id, prob_list in token_probabilities.items():

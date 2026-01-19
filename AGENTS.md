@@ -2,6 +2,12 @@
 
 Machine Learning driven Crypto Trading System using Decentralized Exchange (DEX) token swaps, Temporal Graph Neural Networks (TGNN) and best practices from Marcos López de Prado publications and the book _Advances in Financial Machine Learning_.
 
+## Installation
+
+### PyTorch Geometric on Apple Silicon
+
+For Apple Silicon (M1/M2/M3) users, see [How to Install PyTorch Geometric with Apple Silicon Support](https://medium.com/@dessi.georgieva8/how-to-install-pytorch-geometric-with-apple-silicon-support-m1-m2-m3-39f1a5ad33b6) for installation guidance.
+
 ## System Overview
 
 This project implements a complete ML trading pipeline:
@@ -284,7 +290,7 @@ The pipeline consists of these stages (see Makefile):
 ```
 ingest-swaps → filter-and-decode-swaps → calculate-usdc-prices →
 generate-usdc-bars → make-stationary → label-triple-barrier →
-training-data-validation
+training-data-validation → train (local or Modal)
 ```
 
 ## Stage Descriptions
@@ -296,6 +302,63 @@ training-data-validation
 5. **make-stationary** - Apply fractional differentiation (Prado Ch. 5)
 6. **label-triple-barrier** - Generate labels using triple-barrier method (Prado Ch. 3)
 7. **training-data-validation** - Validate final training dataset quality
+8. **train** - Train TGCN model and backtest (local or Modal cloud)
+
+# Training on Modal
+
+The project supports running the TGCN training on [Modal](https://modal.com/) cloud infrastructure for faster training with more compute resources.
+
+## Local Training
+
+Run training locally (default):
+
+```bash
+uv run python src/dex_contagion_trader.py --epochs 10 --trading-days 5
+```
+
+## Modal Cloud Training
+
+Run training on Modal cloud with GPU (required for correct TGM edge indexing):
+
+```bash
+# First time: authenticate with Modal
+modal setup
+
+# Run training on Modal
+uv run modal run src/modal_train.py --epochs 10 --trading-days 5
+```
+
+### What Modal Training Does
+
+1. **Upload** - Copies input files to Modal volume (`data/labeled_log_fracdiff_price.parquet` and `data/tokens.json`)
+2. **Run** - Executes the full training pipeline on Modal infrastructure (T4 GPU)
+3. **Stream** - Shows live progress in your terminal
+4. **Download** - Saves training log to `data/training.log` locally
+
+### Benefits of Modal
+
+- **GPU acceleration** - T4 GPU for faster training (required for TGM compatibility)
+- **Background** - Training continues even if you close your laptop
+- **Reproducible** - Same environment every time
+- **Cost-effective** - Pay only for compute time used
+
+### Modal Configuration
+
+Modal configuration is in [src/modal_train.py](src/modal_train.py). The script:
+- Uses Python 3.14 to match local environment
+- Mirrors dependencies from `pyproject.toml`
+- Copies training script into the Modal image
+- Runs the exact same code as local training
+- **Requires GPU** - TGM library has different edge indexing behavior on CPU vs GPU
+
+To modify GPU type, edit the `@app.function()` decorator:
+
+```python
+@app.function(
+    gpu="T4",        # Options: "T4" (cheapest), "A10G", "A100"
+    timeout=3600*4,  # 4 hour timeout
+)
+```
 
 # Important Notes
 
@@ -306,9 +369,13 @@ NEVER DELETE A FILE WITHOUT EXPRESS PERMISSION FROM ME OR A DIRECT COMMAND FROM 
 ## Data Sources
 
 - [Google BigQuery Crypto Datasets](https://cloud.google.com/blockchain-analytics/docs/supported-datasets)
+- [BigQuery Blockchain Dataset Schemas](https://cloud.google.com/blockchain-analytics/docs/schema)
 - [Uniswap v4 Deployment Addresses](https://docs.uniswap.org/contracts/v4/deployments)
 - [CoinGecko API](https://www.geckoterminal.com/dex-api)
 - [Demeter Fetch for Block Index](https://github.com/zelos-alpha/demeter-fetch)
+- [Track Liquidity for Token Pairs on Uniswap](https://bitquery.io/blog/how-to-track-liquidity-for-token-pair-on-uniswap)
+- [Query The Graph with Python and Subgrounds](https://thegraph.com/docs/en/subgraphs/querying/python/)
+- [Uniswap Pool Addresses REST Endpoint](https://docs.kaiko.com/rest-api/data-feeds/reference-data/free-tier/on-chain-pools)
 
 ## Prior Art
 

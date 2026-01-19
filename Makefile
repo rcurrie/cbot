@@ -43,9 +43,13 @@ update-train-data: filter-and-decode-swaps calculate-usdc-prices generate-usdc-b
 
 backtest:
 	python src/dex_contagion_trader.py \
-		--epochs 20 \
-		--trading-days 5 
+		--epochs 5 \
+		--trading-days 2 
 
+modal-train:
+	uv run modal run src/modal_train.py \
+		--epochs 5 \
+		--trading-days 2
 
 
 
