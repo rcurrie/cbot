@@ -15,10 +15,16 @@ Sample weights account for label overlap (concurrency) - when multiple training
 samples span the same time period, they're not independent and should be downweighted
 to prevent overfitting (Prado Ch. 4).
 
+**PHASE 1 IMPROVEMENTS (Symmetric + Longer Barriers)**:
+- Symmetric barriers (+/-2*volatility) prevent class imbalance from asymmetric stops
+- Longer vertical barrier (50% daily bars = 4-6 hours) captures crypto trends
+  vs old 10% = 20 minutes which only captured noise
+- Fixes 80% "down" label bias and 70% timeout rate from too-short horizons
+
 WHAT: For each token's price series:
 1. Calculate rolling volatility (window=20 bars by default)
-2. Set dynamic barriers: upper = price + C1*volatility, lower = price - C2*volatility
-3. Set vertical barrier based on token's average bar frequency (adaptive)
+2. Set SYMMETRIC barriers: upper = price + 2*vol, lower = price - 2*vol
+3. Set LONGER vertical barrier (50% of daily bars, adaptive per token)
 4. Look forward to find which barrier is hit first
 5. Assign labels: +1 (upper), -1 (lower), 0 (time limit)
 6. Calculate sample weights based on concurrent label count
@@ -28,7 +34,7 @@ dynamics while preventing data leakage.
 
 HOW:
 1. Group bars by token and calculate rolling volatility
-2. Determine dynamic vertical barrier (fraction of daily bars per token)
+2. Determine dynamic vertical barrier (50% of daily bars per token)
 3. For each bar, look forward up to vertical barrier or until price hits threshold
 4. Track which bar each label extends to (for concurrency calculation)
 5. Weight samples: w = 1 / (number of concurrent labels at that time)
@@ -40,6 +46,7 @@ OUTPUT: data/labeled_log_fracdiff_price.parquet (bars with labels and weights)
 References:
 - Prado AFML Ch. 3.2: Triple-Barrier Method
 - Prado AFML Ch. 4.3: Sample Weights from Label Concurrency
+- Phase 1 Plan: Symmetric barriers + longer vertical for balanced labels
 
 """
 
@@ -498,7 +505,29 @@ def label_triple_barrier(
     logger.info("\n📐 Triple-Barrier Parameters:")
     logger.info("  Upper barrier multiplier (C1): %.2f", upper_multiple)
     logger.info("  Lower barrier multiplier (C2): %.2f", lower_multiple)
-    logger.info("  Barrier fraction (daily vol): %.2f", barrier_fraction)
+
+    # Check for symmetry (Phase 1 recommendation)
+    if upper_multiple == lower_multiple:
+        logger.info("  ✅ Symmetric barriers (Phase 1: prevents class imbalance)")
+    else:
+        logger.warning(
+            "  ⚠️  Asymmetric barriers may cause class imbalance "
+            "(Phase 1 recommends C1=C2=2.0)",
+        )
+
+    logger.info("  Barrier fraction (daily bars): %.2f", barrier_fraction)
+
+    # Check vertical barrier length (Phase 1 recommendation)
+    if barrier_fraction >= 0.4:
+        logger.info(
+            "  ✅ Longer vertical barrier (Phase 1: captures crypto trends)",
+        )
+    else:
+        logger.warning(
+            "  ⚠️  Short vertical barrier may only capture noise "
+            "(Phase 1 recommends 0.5 = 4-6hr)",
+        )
+
     logger.info("  Volatility window: %d bars", volatility_window)
 
     # Process src tokens to generate labels
@@ -887,15 +916,15 @@ def main(
     ),
     upper_multiple: float = typer.Option(
         2.0,
-        help="Multiplier for upper barrier (take profit, C1)",
+        help="Upper barrier multiplier (take profit) - Phase 1: symmetric at 2.0",
     ),
     lower_multiple: float = typer.Option(
-        1.0,
-        help="Multiplier for lower barrier (stop loss, C2)",
+        2.0,
+        help="Lower barrier multiplier (stop loss) - Phase 1: symmetric at 2.0",
     ),
     barrier_fraction: float = typer.Option(
-        0.1,
-        help="Fraction of daily volume for vertical barrier (default 0.1 = 10%)",
+        0.5,
+        help="Vertical barrier: fraction of daily bars (Phase 1: 0.5 = 4-6hr)",
     ),
     volatility_window: int = typer.Option(
         20,
