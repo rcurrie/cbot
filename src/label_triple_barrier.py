@@ -704,6 +704,25 @@ def label_triple_barrier(
     # Save output
     logger.info("\nSaving to %s", output_file)
     output_file.parent.mkdir(parents=True, exist_ok=True)
+
+    # NEW: Log pool state column null counts before saving
+    pool_state_cols = [
+        "src_liquidity_close",
+        "dest_liquidity_close",
+        "src_tick_delta",
+        "dest_tick_delta",
+    ]
+    if all(col in result_df.columns for col in pool_state_cols):
+        logger.info("Pool state features in labeled data:")
+        for col in pool_state_cols:
+            null_count = result_df[col].null_count()
+            logger.info(
+                "  %s: %d nulls (%.1f%%)",
+                col,
+                null_count,
+                100 * null_count / len(result_df) if len(result_df) > 0 else 0,
+            )
+
     result_df.write_parquet(output_file)
 
     logger.info(

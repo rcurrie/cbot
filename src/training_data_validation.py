@@ -59,6 +59,11 @@ EXPECTED_RANGES = {
     "tick_count": (1, 10000),  # At least 1 swap per bar
     "label": (-1.0, 1.0),  # Triple-barrier labels: -1, 0, 1
     "sample_weight": (0.0, 1.0),  # Normalized weights
+    # NEW: Pool state features
+    "src_liquidity_close": (10.0, 25.0),  # log1p of 1e4 to 1e10
+    "dest_liquidity_close": (10.0, 25.0),  # log1p of 1e4 to 1e10
+    "src_tick_delta": (-5.0, 5.0),  # Z-score normalized tick movement
+    "dest_tick_delta": (-5.0, 5.0),  # Z-score normalized tick movement
 }
 
 
@@ -90,6 +95,11 @@ def check_data_integrity(df: pl.DataFrame) -> dict[str, Any]:
         "src_fracdiff",
         "dest_fracdiff",
         "rolling_volatility",
+        # NEW: Pool state features
+        "src_liquidity_close",
+        "dest_liquidity_close",
+        "src_tick_delta",
+        "dest_tick_delta",
     ]
 
     logger.info("\nNull/NaN counts for critical columns:")
@@ -230,6 +240,33 @@ def check_statistical_sanity(df: pl.DataFrame) -> dict[str, Any]:
                 f"  {col} stationarity: mean={mean:.4f}, std={std:.4f} {status}",
             )
             results[f"{col}_stationarity_ok"] = abs(mean) < 2.0
+
+    # NEW: 4. Validate pool state features
+    logger.info("\nPool state feature checks:")
+
+    # Liquidity: check for negative values (should never happen with log1p)
+    for col in ["src_liquidity_close", "dest_liquidity_close"]:
+        if col in df.columns:
+            neg_count = df.filter(pl.col(col) < 0).height
+            status = "❌ FAIL" if neg_count > 0 else "✅ PASS"
+            logger.info(f"  {col} negative values: {neg_count} {status}")
+            results[f"{col}_has_negatives"] = neg_count > 0
+
+    # Tick delta: check normalization (should have mean~0, std~1)
+    for col in ["src_tick_delta", "dest_tick_delta"]:
+        if col in df.columns:
+            valid_df = df.filter(pl.col(col).is_not_null() & pl.col(col).is_finite())
+            if valid_df.shape[0] > 0:
+                mean = valid_df[col].mean()
+                std = valid_df[col].std()
+                # Z-score normalized should be close to mean=0, std=1
+                mean_ok = abs(mean) < 0.1 if mean is not None else False
+                std_ok = 0.8 < (std or 0) < 1.2
+                status = "✅ PASS" if (mean_ok and std_ok) else "⚠️ WARN"
+                logger.info(
+                    f"  {col} normalization: mean={mean:.4f}, std={std:.4f} {status}",
+                )
+                results[f"{col}_normalized_ok"] = mean_ok and std_ok
 
     return results
 

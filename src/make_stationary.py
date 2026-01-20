@@ -453,6 +453,16 @@ def make_stationary(
     output_file.parent.mkdir(parents=True, exist_ok=True)
     result_df.write_parquet(output_file)
 
+    # NEW: Verify pool state columns passed through
+    pool_state_cols = [
+        "src_liquidity_close",
+        "dest_liquidity_close",
+        "src_tick_delta",
+        "dest_tick_delta",
+    ]
+    has_pool_state = all(col in result_df.columns for col in pool_state_cols)
+    logger.info("Pool state columns passed through: %s", has_pool_state)
+
     logger.info(
         "Done! Saved %s bar events with stationary targets to %s",
         f"{len(result_df):,}",

@@ -50,10 +50,13 @@ import os
 from datetime import UTC, datetime
 from pathlib import Path
 
+import numpy as np
 import polars as pl
 import requests
 import typer
 from dotenv import load_dotenv
+
+from filter_and_decode_swaps import decode_liquidity, decode_tick
 
 logger = logging.getLogger(__name__)
 
@@ -337,6 +340,7 @@ def generate_pool_bars(  # noqa: C901, PLR0912, PLR0915
     )
 
     # Join prices with swaps to get token addresses and flow direction
+    # Include 'data' column for decoding pool state (liquidity, tick)
     data = prices_df.join(
         swaps_df.select(
             [
@@ -347,6 +351,7 @@ def generate_pool_bars(  # noqa: C901, PLR0912, PLR0915
                 "token1",
                 "amount0_sign",
                 "amount1_sign",
+                "data",  # NEW: hex data for pool state decoding
             ],
         ),
         on=["pool", "block_timestamp", "transaction_hash"],
@@ -419,6 +424,11 @@ def generate_pool_bars(  # noqa: C901, PLR0912, PLR0915
         seen_swaps = set()  # Track unique swaps for tick count
         last_bar_timestamp = None
 
+        # NEW: Track pool state (liquidity, tick)
+        pool_liquidity: int | None = None  # Last valid liquidity value
+        bar_tick_open: int | None = None  # Tick at bar open
+        bar_tick_close: int | None = None  # Tick at bar close
+
         for row in pool_data.iter_rows(named=True):
             swap_key = (row["block_timestamp"], row["transaction_hash"])
 
@@ -430,6 +440,19 @@ def generate_pool_bars(  # noqa: C901, PLR0912, PLR0915
 
             # Track unique swaps for tick count
             seen_swaps.add(swap_key)
+
+            # NEW: Decode pool state from hex data
+            try:
+                liquidity = decode_liquidity(row["data"])
+                pool_liquidity = liquidity
+
+                tick = decode_tick(row["data"])
+                if bar_tick_open is None:
+                    bar_tick_open = tick  # First tick in bar
+                bar_tick_close = tick  # Update closing tick
+            except Exception:
+                # Silently skip - will use last known values or NaN
+                pass
 
             # Check if bar is complete (use pool-specific threshold)
             if bar_usdc_volume >= pool_bar_threshold:
@@ -487,6 +510,19 @@ def generate_pool_bars(  # noqa: C901, PLR0912, PLR0915
                     src_price = token_b_price
                     dest_price = token_a_price
 
+                # NEW: Calculate pool state features
+                # Liquidity: log1p normalized closing liquidity
+                if pool_liquidity is not None:
+                    liquidity_close = float(np.log1p(float(pool_liquidity)))
+                else:
+                    liquidity_close = float("nan")
+
+                # Tick delta: change from open to close
+                if bar_tick_open is not None and bar_tick_close is not None:
+                    tick_delta = float(bar_tick_close - bar_tick_open)
+                else:
+                    tick_delta = float("nan")
+
                 # Generate single row for this bar (only if we have both prices)
                 if src_price is not None and dest_price is not None:
                     all_bar_rows.append(
@@ -501,6 +537,11 @@ def generate_pool_bars(  # noqa: C901, PLR0912, PLR0915
                             "dest_price_usdc": dest_price,
                             "bar_time_delta_sec": bar_time_delta_sec,
                             "tick_count": tick_count,
+                            # NEW: Pool state features (same for both src and dest)
+                            "src_liquidity_close": liquidity_close,
+                            "dest_liquidity_close": liquidity_close,
+                            "src_tick_delta": tick_delta,
+                            "dest_tick_delta": tick_delta,
                         },
                     )
 
@@ -509,6 +550,9 @@ def generate_pool_bars(  # noqa: C901, PLR0912, PLR0915
                 bar_usdc_volume = 0.0
                 bar_price_records = []
                 seen_swaps = set()
+                # NEW: Reset pool state tracking
+                bar_tick_open = None
+                bar_tick_close = None
 
     logger.info(
         "Generated %d bar messages from %d pools",
@@ -616,6 +660,20 @@ def generate_pool_bars(  # noqa: C901, PLR0912, PLR0915
             .otherwise(pl.col("bar_time_delta_sec"))
             .alias("bar_time_delta_sec"),
         )
+
+    # NEW: Normalize tick deltas with z-score normalization
+    # This centers tick movement at 0 with unit variance, making it comparable to fracdiff
+    logger.info("Normalizing tick deltas with z-score...")
+    for col in ["src_tick_delta", "dest_tick_delta"]:
+        mean = output_df[col].mean()
+        std = output_df[col].std()
+        if std is not None and std > 0:
+            output_df = output_df.with_columns(
+                ((pl.col(col) - mean) / std).alias(col),
+            )
+            logger.info("  %s: mean=%.4f, std=%.4f", col, mean, std)
+        else:
+            logger.warning("  %s: Cannot normalize (std=0 or None)", col)
 
     logger.info("\nBar Statistics:")
     logger.info("  Total messages: %s", f"{len(output_df):,}")
@@ -1044,6 +1102,36 @@ def validate_output(df_bars: pl.DataFrame) -> None:  # noqa: C901, PLR0912, PLR0
     logger.info("  Unique tokens (src): %d", unique_src_tokens)
     logger.info("  Unique tokens (dest): %d", unique_dest_tokens)
     logger.info("  Unique tokens (combined): %d", len(unique_tokens))
+
+    # NEW: 10. Validate pool state features (liquidity, tick)
+    logger.info("\n10. Validating pool state features...")
+    for col in ["src_liquidity_close", "dest_liquidity_close"]:
+        null_count = df_bars[col].null_count()
+        median = df_bars[col].median()
+        neg_count = df_bars.filter(pl.col(col) < 0).height
+        logger.info(
+            "  %s: %d nulls (%.1f%%), median=%.2e, negative=%d",
+            col,
+            null_count,
+            100 * null_count / len(df_bars) if len(df_bars) > 0 else 0,
+            median if median is not None else 0,
+            neg_count,
+        )
+        if neg_count > 0:
+            logger.error("  ❌ ERROR: Negative liquidity values in %s", col)
+
+    for col in ["src_tick_delta", "dest_tick_delta"]:
+        null_count = df_bars[col].null_count()
+        mean = df_bars[col].mean()
+        std = df_bars[col].std()
+        logger.info(
+            "  %s: %d nulls (%.1f%%), mean=%.4f, std=%.4f",
+            col,
+            null_count,
+            100 * null_count / len(df_bars) if len(df_bars) > 0 else 0,
+            mean if mean is not None else 0,
+            std if std is not None else 0,
+        )
 
     logger.info("")
     logger.info("=" * 70)
