@@ -20,17 +20,18 @@ WHAT: Daily sliding backtest implementing:
 5. Calculate returns and slide forward 1 day, retraining from scratch
 6. Aggregate performance metrics: Sharpe ratio, max drawdown, win rate
 
-Binary classification strategy: Model predicts up (invest) vs down (don't invest).
-Original triple-barrier labels (up/stay/down) are merged: stay+up → up (invest),
-down → down (no invest). This focuses the model on avoiding losses.
+Ternary classification strategy (PHASE 2): Model predicts {-1: down, 0: stay, +1: up}.
+Preserves all label information (37% more than binary merge). Position sizing via Kelly
+criterion: bet_size = (P(up) - P(down)) / 2, only invest when positive edge exists.
+This focuses the model on high-conviction opportunities with appropriate risk scaling.
 
 HOW:
 1. Build temporal graph from labeled bars with bidirectional edges
 2. Node features: fracdiff price, rolling volatility, flow magnitude (dynamic)
 3. Edge features: flow magnitude as attention weights
 4. TGCN architecture: learnable embeddings + feature projection + message passing
-5. Training: Binary cross-entropy with class weights and Prado sample weights
-6. Prediction: Softmax probabilities, invest in tokens with P(up) > 0.5
+5. Training: Cross-entropy with class weights for all 3 classes and Prado sample weights
+6. Prediction: Kelly position sizing = (P(up) - P(down)) / 2, only invest when positive
 7. Returns: Track intraday performance with stop-loss/take-profit exits
 
 INPUT: data/labeled_log_fracdiff_price.parquet (final labeled training data)
@@ -94,8 +95,11 @@ DYNAMIC_NODE_FEAT_DIM = 5  # fracdiff, volatility, flow, label, weight
 NODE_INPUT_DIM = 3  # fracdiff, volatility, flow (first 3 of dynamic features)
 NODE_EMBED_DIM = 64
 HIDDEN_DIM = 64
-NUM_CLASSES = 2  # Binary classification: down (0), up (1)
-LABEL_UP = 1
+NUM_CLASSES = 3  # Ternary classification: down (-1→0), stay (0→1), up (1→2)
+LABEL_DOWN = 0  # Mapped from -1
+LABEL_STAY = 1  # Mapped from 0
+LABEL_UP = 2  # Mapped from 1
+MIN_KELLY_FRACTION = 0.10  # Minimum position size (10% of capital)
 BATCH_SIZE = 100
 BATCH_UNIT = "s"  # Batch by 100 seconds (which are events in our case)
 LEARNING_RATE = 1e-3
@@ -313,7 +317,7 @@ class TokenPredictorModel(nn.Module):
             num_nodes: Total number of tokens in graph.
             node_feat_dim: Dimension of input node features (fracdiff, etc).
             node_embed_dim: Embedding dimension (used for TGCN).
-            output_dim: Number of output classes (3: down/stay/up).
+            output_dim: Number of output classes (3: down/stay/up for ternary).
             device: Device to place tensors on.
 
         """
@@ -467,9 +471,9 @@ def build_window(
     dest_flow = df_window["dest_flow_usdc"].to_numpy()
     volatility = df_window["rolling_volatility"].to_numpy()
 
-    # Binary classification: merge stay into up (0 or 1 -> 1 for up, -1 -> 0 for down)
+    # Ternary classification (PHASE 2): keep all three classes {-1, 0, +1}
     # Original labels: -1=down, 0=stay, 1=up
-    # New binary labels: 0=down (no invest), 1=up (consider invest)
+    # Mapped to indices: -1→0 (down), 0→1 (stay), 1→2 (up) for PyTorch
     # Fill null with -999 to mark unlabeled nodes (cleaned upstream in pipeline)
 
     # Src token labels (always present after pipeline filtering)
@@ -477,7 +481,7 @@ def build_window(
     src_labels = np.where(
         raw_src_labels == -999,
         -999,
-        np.where(raw_src_labels >= 0, 1, 0),
+        raw_src_labels + 1,  # Map {-1, 0, 1} → {0, 1, 2}
     )
     src_weights = df_window["sample_weight"].to_numpy()
 
@@ -488,7 +492,7 @@ def build_window(
     dest_labels = np.where(
         raw_dest_labels == -999,
         -999,
-        np.where(raw_dest_labels >= 0, 1, 0),
+        raw_dest_labels + 1,  # Map {-1, 0, 1} → {0, 1, 2}
     )
     dest_weights = df_window["dest_sample_weight"].fill_null(0.0).to_numpy()
 
@@ -560,7 +564,7 @@ def compute_class_weights(
         Tuple of (class_weights tensor, label_counts dict).
 
     """
-    label_counts = {0: 0, 1: 0}
+    label_counts = {0: 0, 1: 0, 2: 0}  # down, stay, up
     for batch in loader:
         if batch.src.shape[0] == 0 or batch.node_ids is None:
             continue
@@ -579,9 +583,10 @@ def compute_class_weights(
             if label_counts[i] > 0:
                 class_weights[i] = total / (NUM_CLASSES * label_counts[i])
         logger.info(
-            "Class weights: Down=%.2f, Up=%.2f",
+            "Class weights: Down=%.2f, Stay=%.2f, Up=%.2f",
             class_weights[0],
             class_weights[1],
+            class_weights[2],
         )
 
     return class_weights, label_counts
@@ -717,7 +722,7 @@ def train_model(
                 continue
 
             # Extract labels and weights
-            # Binary labels: 0=down (no invest), 1=up (consider invest)
+            # Ternary labels: 0=down, 1=stay, 2=up (mapped from {-1, 0, +1})
             has_label = batch_data.dynamic_node_feats[:, 3] != -999
             y_true = batch_data.dynamic_node_feats[has_label, 3].long()
             batch_weights = batch_data.dynamic_node_feats[has_label, 4].float()
@@ -811,12 +816,18 @@ def train_model(
 
     if total_labels > 0:
         down_pct = label_counts[0] / total_labels * 100
-        up_pct = label_counts[1] / total_labels * 100
+        stay_pct = label_counts[1] / total_labels * 100
+        up_pct = label_counts[2] / total_labels * 100
         logger.info(
-            "Label distribution - Down: %d (%.1f%%), Up: %d (%.1f%%)",
+            (
+                "Label distribution - Down: %d (%.1f%%), "
+                "Stay: %d (%.1f%%), Up: %d (%.1f%%)"
+            ),
             label_counts[0],
             down_pct,
             label_counts[1],
+            stay_pct,
+            label_counts[2],
             up_pct,
         )
 
@@ -827,8 +838,12 @@ def predict_top_tokens(
     le: LabelEncoder,
     device: str,
     top_n: int = 5,
-) -> list[tuple[str, float]]:
-    """Predict top N tokens by bullish score.
+) -> list[tuple[str, float, float]]:
+    """Predict top N tokens with Kelly criterion position sizing.
+
+    PHASE 2: Uses ternary classification probabilities to calculate optimal
+    position sizes via Kelly criterion: kelly_fraction = (P(up) - P(down)) / 2.
+    Only returns tokens with positive expected edge (P(up) > P(down)).
 
     Args:
         model: TokenPredictorModel instance.
@@ -838,15 +853,18 @@ def predict_top_tokens(
         top_n: Number of top tokens to return.
 
     Returns:
-        List of (token_address, bullish_score) tuples, sorted descending.
+        List of (token_address, expected_return, kelly_fraction) tuples.
+        - expected_return: P(up) - P(down) (positive edge only)
+        - kelly_fraction: Position size as fraction of capital (0.1 to 0.5)
 
     """
     model.eval()
     dg = DGraph(data, device=device)
     loader = DGDataLoader(dg, batch_size=BATCH_SIZE, batch_unit=BATCH_UNIT)
 
-    # Store probabilities instead of hard predictions for more robust confidence
-    token_probabilities: dict[int, list[float]] = {}
+    # Store ternary probabilities for Kelly criterion calculation
+    # Each token gets list of [P(down), P(stay), P(up)] probability vectors
+    token_probabilities: dict[int, list[np.ndarray]] = {}
     total_batches = sum(1 for _ in loader)
 
     # Prediction loop with periodic progress logging
@@ -865,22 +883,21 @@ def predict_top_tokens(
                 continue
 
             # Convert logits to probabilities using softmax
-            probs = torch.softmax(logits, dim=1)
-            # Extract probability of "up" class (index 1 in binary classification)
-            up_probs = probs[:, LABEL_UP].cpu().numpy()
+            # Shape: [num_labeled_nodes, 3] where columns are [P(down), P(stay), P(up)]
+            probs = torch.softmax(logits, dim=1).cpu().numpy()
 
             # Get node_ids for labeled nodes only
             has_label = batch_data.dynamic_node_feats[:, 3] != -999
             labeled_node_ids = batch_data.node_ids[has_label].cpu().numpy()
 
-            for node_id, prob in zip(
+            for node_id, prob_vector in zip(
                 labeled_node_ids,
-                up_probs,
+                probs,
                 strict=True,
             ):
                 if node_id not in token_probabilities:
                     token_probabilities[node_id] = []
-                token_probabilities[node_id].append(prob)
+                token_probabilities[node_id].append(prob_vector)
 
             batches_processed += 1
 
@@ -894,47 +911,58 @@ def predict_top_tokens(
                     total_batches,
                 )
 
-    recommendations: list[tuple[str, float]] = []
-    for node_id, prob_list in token_probabilities.items():
-        # Average probability of "up" across all predictions for this token
-        bullish_score = np.mean(prob_list)
-        token_addr = le.inverse_transform([node_id])[0]
-        recommendations.append((token_addr, bullish_score))
+    # Calculate Kelly criterion position sizing for each token
+    recommendations: list[tuple[str, float, float]] = []
+    for node_id, prob_vectors in token_probabilities.items():
+        # Average probabilities across all predictions for this token
+        avg_probs = np.mean(prob_vectors, axis=0)  # [P(down), P(stay), P(up)]
+        p_down = avg_probs[LABEL_DOWN]
+        p_up = avg_probs[LABEL_UP]
 
-    # Sort by bullish score descending
+        # Kelly criterion: kelly_fraction = (P(up) - P(down)) / 2
+        # This is simplified Kelly assuming equal ±100% moves
+        expected_return = p_up - p_down
+        kelly_fraction = expected_return / 2.0
+
+        # Only invest if positive expected edge and meets minimum threshold
+        if expected_return > 0 and kelly_fraction >= MIN_KELLY_FRACTION:
+            # Cap Kelly at 0.5 (half-Kelly for safety in volatile crypto markets)
+            kelly_fraction = min(kelly_fraction, 0.5)
+
+            token_addr = le.inverse_transform([node_id])[0]
+            recommendations.append((token_addr, expected_return, kelly_fraction))
+
+    # Sort by expected return descending (highest edge first)
     recommendations.sort(key=lambda x: x[1], reverse=True)
 
-    # Filter to only tokens predicted to go UP (probability > 0.5)
-    # Then take top N among those with positive predictions
-    bullish_recommendations = [
-        (addr, score) for addr, score in recommendations if score > 0.5
-    ]
-
-    return bullish_recommendations[:top_n]
+    return recommendations[:top_n]
 
 
 def calculate_daily_returns(
     df_trade: pl.DataFrame,
-    top_tokens: list[tuple[str, float]],
-) -> dict[str, float]:
-    """Calculate daily returns for predicted tokens with stop loss and take profit.
+    top_tokens: list[tuple[str, float, float]],
+) -> dict[str, tuple[float, float]]:
+    """Calculate daily returns with Kelly criterion position sizing.
 
-    For each token predicted to go long, simulate intraday position:
+    PHASE 2: For each token, simulate intraday position with variable sizing:
+    - Position size determined by Kelly criterion (not equal-weighted)
     - Exit if price drops by STOP_LOSS_PCT
     - Exit if price gains by TAKE_PROFIT_PCT
     - Otherwise hold until 5pm
 
     Args:
         df_trade: DataFrame with swap events for the trade date.
-        top_tokens: List of (token_address, bullish_score) tuples.
+        top_tokens: List of (token_address, expected_return, kelly_fraction) tuples.
 
     Returns:
-        Dict mapping token_address to daily_return (as decimal, e.g., 0.05 = 5%).
+        Dict mapping token_address to (daily_return, position_size) tuples.
+        - daily_return: Token return as decimal (e.g., 0.05 = 5%)
+        - position_size: Kelly fraction used (for portfolio calculation)
 
     """
-    returns: dict[str, float] = {}
+    returns: dict[str, tuple[float, float]] = {}
 
-    for token_addr, _ in top_tokens:
+    for token_addr, _, kelly_fraction in top_tokens:
         # Find all swaps where this token is src_token (we go long when swapping it out)
         token_events = df_trade.filter(
             pl.col("src_token_id") == token_addr,
@@ -942,7 +970,7 @@ def calculate_daily_returns(
 
         if len(token_events) == 0:
             logger.debug("No events for token %s", token_addr[:10])
-            returns[token_addr] = 0.0
+            returns[token_addr] = (0.0, kelly_fraction)
             continue
 
         # Get price series during the day
@@ -950,7 +978,7 @@ def calculate_daily_returns(
         prices = prices[~np.isnan(prices)]
 
         if len(prices) < 2:
-            returns[token_addr] = 0.0
+            returns[token_addr] = (0.0, kelly_fraction)
             continue
 
         start_price = prices[0]
@@ -982,12 +1010,12 @@ def calculate_daily_returns(
             else:
                 final_return = 0.0
 
-        returns[token_addr] = final_return
+        returns[token_addr] = (final_return, kelly_fraction)
 
     return returns
 
 
-def compute_backtest_summary(results: list[dict]) -> None:
+def compute_backtest_summary(results: list[dict[str, Any]]) -> None:
     """Compute and log comprehensive backtest performance summary.
 
     Extract portfolio returns from results and calculate key metrics: total return,
@@ -1220,13 +1248,13 @@ def backtest_slide(
         )
 
         logger.info(
-            "Top tokens predicted to go UP (score > 50%%) at 9am: %d",
+            "Top tokens with positive expected edge (Kelly > 10%%) at 9am: %d",
             len(top_tokens),
         )
 
-        # Skip if no tokens meet the bullish threshold
+        # Skip if no tokens meet the Kelly threshold
         if len(top_tokens) == 0:
-            logger.info("No tokens predicted to go up, skipping trading day")
+            logger.info("No tokens with positive edge, skipping trading day")
             results.append(
                 {
                     "train_start": train_start_date,
@@ -1255,26 +1283,46 @@ def backtest_slide(
         # Calculate token returns with stop loss and take profit
         token_returns = calculate_daily_returns(df_trading, top_tokens)
 
-        for rank, (token_addr, score) in enumerate(top_tokens, 1):
+        for rank, (token_addr, expected_return, kelly_fraction) in enumerate(
+            top_tokens,
+            1,
+        ):
             token_addr_lower = token_addr.lower()
             token_meta = tokens_metadata.get(token_addr_lower, {})
             symbol = token_meta.get("symbol", token_addr[:10])
-            daily_return = token_returns.get(token_addr, 0.0)
+            daily_return, position_size = token_returns.get(
+                token_addr,
+                (0.0, kelly_fraction),
+            )
             logger.info(
-                "  %d. %s | Score: %.2f%% | Return: %+.2f%%",
+                "  %d. %s | Edge: %.1f%% | Size: %.1f%% | Return: %+.2f%%",
                 rank,
                 symbol,
-                score * 100,
+                expected_return * 100,
+                position_size * 100,
                 daily_return * 100,
             )
 
-        # Calculate equal-weighted portfolio return
+        # Calculate Kelly-weighted portfolio return
+        # Each position contributes: position_size * token_return
+        total_position_size = sum(
+            kelly_frac for _, _, kelly_frac in top_tokens
+        )
+        weighted_return = sum(
+            ret * size
+            for ret, size in token_returns.values()
+        )
+        # Normalize by total position size (may be < 1.0 if not fully invested)
         portfolio_return = (
-            sum(token_returns.values()) / len(token_returns)
-            if len(token_returns) > 0
+            weighted_return / total_position_size
+            if total_position_size > 0
             else 0.0
         )
-        logger.info("Portfolio return: %+.2f%%", portfolio_return * 100)
+        logger.info(
+            "Portfolio return: %+.2f%% (%.1f%% capital deployed)",
+            portfolio_return * 100,
+            total_position_size * 100,
+        )
 
         results.append(
             {
