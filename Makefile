@@ -30,6 +30,11 @@ generate-usdc-bars:
 make-stationary:
 	python src/make_stationary.py --verbose --validate
 
+embed:
+	python src/generate_embeddings.py \
+		--epochs 50 \
+		--patience 5
+
 label-triple-barrier:
 	python src/label_triple_barrier.py --verbose --validate
 
@@ -37,19 +42,29 @@ training-data-validation:
 	python src/training_data_validation.py
 
 
+update-embedding-data: filter-and-decode-swaps calculate-usdc-prices generate-usdc-bars make-stationary
+
 
 update-train-data: filter-and-decode-swaps calculate-usdc-prices generate-usdc-bars make-stationary label-triple-barrier training-data-validation
 
 
 backtest:
 	python src/dex_contagion_trader.py \
-		--epochs 5 \
-		--trading-days 2 
+		--save-embeddings \
+		--epochs 50 \
+		--trading-days 3 
 
 modal-train:
 	uv run modal run src/modal_train.py \
-		--epochs 5 \
-		--trading-days 2
+		--epochs 50 \
+		--trading-days 5
+
+ldr-tgn-trader:
+	uv run python src/ldr_tgn_trader.py \
+		--epochs 50 \
+		--train-days 30 \
+		--trading-days 15 \
+		--save-embeddings
 
 
 

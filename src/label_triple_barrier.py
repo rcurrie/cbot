@@ -373,7 +373,7 @@ def _log_output_statistics(result_df: pl.DataFrame, verbose: bool) -> None:
 def _process_token_labels(
     df: pl.DataFrame,
     token_col: str,
-    fracdiff_col: str,
+    price_col: str,
     barrier_fraction: float,
     volatility_window: int,
     upper_multiple: float,
@@ -384,7 +384,7 @@ def _process_token_labels(
     Args:
         df: Input DataFrame.
         token_col: Column name for token ID (src_token_id or dest_token_id).
-        fracdiff_col: Column name for fracdiff price (src_fracdiff or dest_fracdiff).
+        price_col: Column name for raw price (src_price_usdc or dest_price_usdc).
         barrier_fraction: Fraction of daily volume for vertical barrier.
         volatility_window: Rolling window for volatility calculation.
         upper_multiple: Multiplier for upper barrier (take profit).
@@ -427,20 +427,28 @@ def _process_token_labels(
                 barrier_fraction=barrier_fraction,
             )
 
-            # Get price series (stationary target)
-            prices = token_df[fracdiff_col].to_numpy()
+            # Get price series (raw price for financial labels)
+            raw_prices = token_df[price_col].to_numpy()
 
             # Check for invalid data
-            if len(prices) < volatility_window + vertical_bars:
+            if len(raw_prices) < volatility_window + vertical_bars:
                 progress.update(task, advance=1)
                 continue
 
-            # Calculate rolling volatility
-            volatilities = calculate_rolling_volatility(prices, volatility_window)
+            # Log transform for geometric returns (handle zeros safely)
+            log_prices = np.log(np.maximum(raw_prices, 1e-18))
+
+            # Calculate returns for volatility (diff of log prices)
+            returns = np.zeros_like(log_prices)
+            returns[1:] = np.diff(log_prices)
+
+            # Calculate rolling volatility of RETURNS
+            volatilities = calculate_rolling_volatility(returns, volatility_window)
 
             # Apply triple-barrier method
+            # Barriers applied to log_prices: log_p_t + (vol_returns * multiple)
             labels, barrier_touch_bars = apply_triple_barrier(
-                prices,
+                log_prices,
                 volatilities,
                 upper_multiple,
                 lower_multiple,
@@ -537,7 +545,7 @@ def label_triple_barrier(
     src_labels_df = _process_token_labels(
         df,
         "src_token_id",
-        "src_fracdiff",
+        "src_price_usdc",
         barrier_fraction,
         volatility_window,
         upper_multiple,
@@ -556,7 +564,7 @@ def label_triple_barrier(
     dest_labels_df = _process_token_labels(
         df,
         "dest_token_id",
-        "dest_fracdiff",
+        "dest_price_usdc",
         barrier_fraction,
         volatility_window,
         upper_multiple,
@@ -576,47 +584,55 @@ def label_triple_barrier(
     # Join src labels
     if len(src_labels_df) > 0:
         # Select only the columns we need for joining
-        src_join = src_labels_df.select([
-            "src_token_id",
-            "bar_close_timestamp",
-            pl.col("_label").alias("label"),
-            pl.col("_sample_weight").alias("sample_weight"),
-            pl.col("_volatility").alias("rolling_volatility"),
-            pl.col("_barrier_touch_bars").alias("barrier_touch_bars"),
-        ])
+        src_join = src_labels_df.select(
+            [
+                "src_token_id",
+                "bar_close_timestamp",
+                pl.col("_label").alias("label"),
+                pl.col("_sample_weight").alias("sample_weight"),
+                pl.col("_volatility").alias("rolling_volatility"),
+                pl.col("_barrier_touch_bars").alias("barrier_touch_bars"),
+            ]
+        )
         result_df = df.join(
             src_join,
             on=["src_token_id", "bar_close_timestamp"],
             how="left",
         )
     else:
-        result_df = df.with_columns([
-            pl.lit(np.nan).alias("label"),
-            pl.lit(np.nan).alias("sample_weight"),
-            pl.lit(np.nan).alias("rolling_volatility"),
-            pl.lit(np.nan).alias("barrier_touch_bars"),
-        ])
+        result_df = df.with_columns(
+            [
+                pl.lit(np.nan).alias("label"),
+                pl.lit(np.nan).alias("sample_weight"),
+                pl.lit(np.nan).alias("rolling_volatility"),
+                pl.lit(np.nan).alias("barrier_touch_bars"),
+            ]
+        )
 
     # Join dest labels
     if len(dest_labels_df) > 0:
-        dest_join = dest_labels_df.select([
-            "dest_token_id",
-            "bar_close_timestamp",
-            pl.col("_label").alias("dest_label"),
-            pl.col("_sample_weight").alias("dest_sample_weight"),
-            pl.col("_barrier_touch_bars").alias("dest_barrier_touch_bars"),
-        ])
+        dest_join = dest_labels_df.select(
+            [
+                "dest_token_id",
+                "bar_close_timestamp",
+                pl.col("_label").alias("dest_label"),
+                pl.col("_sample_weight").alias("dest_sample_weight"),
+                pl.col("_barrier_touch_bars").alias("dest_barrier_touch_bars"),
+            ]
+        )
         result_df = result_df.join(
             dest_join,
             on=["dest_token_id", "bar_close_timestamp"],
             how="left",
         )
     else:
-        result_df = result_df.with_columns([
-            pl.lit(np.nan).alias("dest_label"),
-            pl.lit(np.nan).alias("dest_sample_weight"),
-            pl.lit(np.nan).alias("dest_barrier_touch_bars"),
-        ])
+        result_df = result_df.with_columns(
+            [
+                pl.lit(np.nan).alias("dest_label"),
+                pl.lit(np.nan).alias("dest_sample_weight"),
+                pl.lit(np.nan).alias("dest_barrier_touch_bars"),
+            ]
+        )
 
     # Gather token statistics from both src and dest
     logger.info("\n" + "=" * 70)
@@ -627,44 +643,48 @@ def label_triple_barrier(
     # Get stats from src labels
     if len(src_labels_df) > 0:
         src_stats = (
-            src_labels_df
-            .filter(pl.col("_label").is_not_nan())
+            src_labels_df.filter(pl.col("_label").is_not_nan())
             .group_by("src_token_id")
-            .agg([
-                pl.len().alias("n_total"),
-                (pl.col("_label") == 1).sum().alias("n_positive"),
-                (pl.col("_label") == -1).sum().alias("n_negative"),
-                (pl.col("_label") == 0).sum().alias("n_neutral"),
-                pl.col("_sample_weight").mean().alias("mean_sample_weight"),
-            ])
+            .agg(
+                [
+                    pl.len().alias("n_total"),
+                    (pl.col("_label") == 1).sum().alias("n_positive"),
+                    (pl.col("_label") == -1).sum().alias("n_negative"),
+                    (pl.col("_label") == 0).sum().alias("n_neutral"),
+                    pl.col("_sample_weight").mean().alias("mean_sample_weight"),
+                ]
+            )
         )
-        token_stats.extend([
-            {
-                "token_id": row["src_token_id"],
-                "n_total": row["n_total"],
-                "n_valid_labels": row["n_total"],
-                "n_positive": row["n_positive"],
-                "n_negative": row["n_negative"],
-                "n_neutral": row["n_neutral"],
-                "mean_sample_weight": row["mean_sample_weight"],
-            }
-            for row in src_stats.iter_rows(named=True)
-        ])
+        token_stats.extend(
+            [
+                {
+                    "token_id": row["src_token_id"],
+                    "n_total": row["n_total"],
+                    "n_valid_labels": row["n_total"],
+                    "n_positive": row["n_positive"],
+                    "n_negative": row["n_negative"],
+                    "n_neutral": row["n_neutral"],
+                    "mean_sample_weight": row["mean_sample_weight"],
+                }
+                for row in src_stats.iter_rows(named=True)
+            ]
+        )
 
     # Add stats from dest labels (combine with existing src stats if token
     # appears in both)
     if len(dest_labels_df) > 0:
         dest_stats = (
-            dest_labels_df
-            .filter(pl.col("_label").is_not_nan())
+            dest_labels_df.filter(pl.col("_label").is_not_nan())
             .group_by("dest_token_id")
-            .agg([
-                pl.len().alias("n_total"),
-                (pl.col("_label") == 1).sum().alias("n_positive"),
-                (pl.col("_label") == -1).sum().alias("n_negative"),
-                (pl.col("_label") == 0).sum().alias("n_neutral"),
-                pl.col("_sample_weight").mean().alias("mean_sample_weight"),
-            ])
+            .agg(
+                [
+                    pl.len().alias("n_total"),
+                    (pl.col("_label") == 1).sum().alias("n_positive"),
+                    (pl.col("_label") == -1).sum().alias("n_negative"),
+                    (pl.col("_label") == 0).sum().alias("n_neutral"),
+                    pl.col("_sample_weight").mean().alias("mean_sample_weight"),
+                ]
+            )
         )
         # Merge with existing stats or add new ones
         token_dict = {s["token_id"]: s for s in token_stats}
@@ -706,20 +726,22 @@ def label_triple_barrier(
 
     # Replace NaN with null in dest columns for cleaner downstream handling
     # NaN values cause issues when casting to int64, null is safer
-    result_df = result_df.with_columns([
-        pl.when(pl.col("dest_label").is_nan())
-        .then(pl.lit(None))
-        .otherwise(pl.col("dest_label"))
-        .alias("dest_label"),
-        pl.when(pl.col("dest_sample_weight").is_nan())
-        .then(pl.lit(None))
-        .otherwise(pl.col("dest_sample_weight"))
-        .alias("dest_sample_weight"),
-        pl.when(pl.col("dest_barrier_touch_bars").is_nan())
-        .then(pl.lit(None))
-        .otherwise(pl.col("dest_barrier_touch_bars"))
-        .alias("dest_barrier_touch_bars"),
-    ])
+    result_df = result_df.with_columns(
+        [
+            pl.when(pl.col("dest_label").is_nan())
+            .then(pl.lit(None))
+            .otherwise(pl.col("dest_label"))
+            .alias("dest_label"),
+            pl.when(pl.col("dest_sample_weight").is_nan())
+            .then(pl.lit(None))
+            .otherwise(pl.col("dest_sample_weight"))
+            .alias("dest_sample_weight"),
+            pl.when(pl.col("dest_barrier_touch_bars").is_nan())
+            .then(pl.lit(None))
+            .otherwise(pl.col("dest_barrier_touch_bars"))
+            .alias("dest_barrier_touch_bars"),
+        ]
+    )
 
     n_after = len(result_df)
     n_dropped = n_before - n_after
@@ -834,9 +856,7 @@ def validate_output(output_file: Path, verbose: bool = False) -> None:
 
     # 5. Validate label distribution
     logger.info("\n5. Checking label distribution...")
-    label_counts = (
-        df.group_by("label").agg(pl.len().alias("count")).sort("label")
-    )
+    label_counts = df.group_by("label").agg(pl.len().alias("count")).sort("label")
     logger.info("  Label distribution:")
     for row in label_counts.iter_rows(named=True):
         logger.info("    Label %+d: %s", int(row["label"]), f"{row['count']:,}")
@@ -871,12 +891,14 @@ def validate_output(output_file: Path, verbose: bool = False) -> None:
 
     # 7. Sample weight validation
     logger.info("\n7. Validating sample weights...")
-    weight_stats = df.select([
-        pl.col("sample_weight").min().alias("min"),
-        pl.col("sample_weight").max().alias("max"),
-        pl.col("sample_weight").mean().alias("mean"),
-        pl.col("sample_weight").median().alias("median"),
-    ]).to_dicts()[0]
+    weight_stats = df.select(
+        [
+            pl.col("sample_weight").min().alias("min"),
+            pl.col("sample_weight").max().alias("max"),
+            pl.col("sample_weight").mean().alias("mean"),
+            pl.col("sample_weight").median().alias("median"),
+        ]
+    ).to_dicts()[0]
 
     logger.info("  Min: %.3f", weight_stats["min"])
     logger.info("  Max: %.3f", weight_stats["max"])

@@ -832,6 +832,56 @@ def train_model(
         )
 
 
+def save_embeddings(
+    model: TokenPredictorModel,
+    le: LabelEncoder,
+    trade_date: date,
+    output_dir: Path,
+) -> Path:
+    """Extract and save token embeddings from trained model.
+
+    Saves the learnable token embeddings to a .npz file for later evaluation.
+    These embeddings capture the learned "personality" of each token based on
+    graph structure and swap dynamics.
+
+    Args:
+        model: Trained TokenPredictorModel instance.
+        le: LabelEncoder for decoding token IDs.
+        trade_date: Trading date (used for filename).
+        output_dir: Directory to save embeddings.
+
+    Returns:
+        Path to saved embeddings file.
+
+    """
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Extract learnable embeddings
+    embeddings = model.node_embeddings.detach().cpu().numpy()
+
+    # Get token addresses for each embedding row
+    token_addresses = le.classes_
+
+    # Create output filename with date
+    date_str = trade_date.strftime("%Y%m%d")
+    output_path = output_dir / f"tgcn_embeddings_{date_str}.npz"
+
+    # Save embeddings and metadata
+    np.savez(
+        output_path,
+        embeddings=embeddings,
+        token_addresses=token_addresses,
+        trade_date=str(trade_date),
+        embed_dim=model.node_embed_dim,
+        num_tokens=model.num_nodes,
+    )
+
+    logger.info("Saved embeddings to: %s", output_path)
+    logger.info("  Shape: %s", embeddings.shape)
+
+    return output_path
+
+
 def predict_top_tokens(
     model: TokenPredictorModel,
     data: DGData,
@@ -1134,6 +1184,7 @@ def backtest_slide(
     tokens_metadata: dict[str, dict[str, Any]],
     epochs: int,
     trading_days: int | None = None,
+    save_embeddings_flag: bool = False,
 ) -> None:
     """Run sliding backtest: daily retrain and trade.
 
@@ -1152,6 +1203,7 @@ def backtest_slide(
         tokens_metadata: Dictionary mapping token address to metadata.
         epochs: Number of training epochs per day.
         trading_days: Number of days to trade (None = all available days).
+        save_embeddings_flag: If True, save token embeddings after each training day.
 
     """
     logger.info("=" * DIVIDER_LENGTH)
@@ -1237,6 +1289,15 @@ def backtest_slide(
             DEVICE,
             epochs=epochs,
         )
+
+        # Save embeddings if requested
+        if save_embeddings_flag:
+            save_embeddings(
+                model,
+                le,
+                trade_date,
+                Path("data/embeddings"),
+            )
 
         # Predict at 9am using all training data (including morning)
         top_tokens = predict_top_tokens(
@@ -1363,6 +1424,11 @@ def main(
         "--trading-days",
         help="Number of days to trade (default: all available)",
     ),
+    save_embeddings: bool = typer.Option(
+        False,
+        "--save-embeddings",
+        help="Save token embeddings after each training day to data/embeddings/",
+    ),
 ) -> None:
     """Run daily sliding backtest for TGCN token predictions.
 
@@ -1393,6 +1459,7 @@ def main(
         tokens_metadata,
         epochs,
         trading_days,
+        save_embeddings,
     )
 
 
