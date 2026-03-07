@@ -9,11 +9,23 @@ ingest-swaps:
 		--verbose 
 
 ingest-pools:
-	echo "Updating pools.json from kaiko.io..."	
-	curl --compressed -H "Accept: application/json" \
-		"https://reference-data-api.kaiko.io/v1/pools" \
-		> data/pools.json
+# 	echo "Updating pools.json from kaiko.io..."	
+# 	curl --compressed -H "Accept: application/json" \
+# 		"https://reference-data-api.kaiko.io/v1/pools" \
+# 		> data/pools.json
+	echo "Generating tokens.json from pools.json..."
+	python src/pools_to_tokens.py --verbose
 
+ingest-tokens:
+	echo "Updating tokens.json..."	
+	curl --compressed -H 'Accept: application/json' \
+		"https://ipfs.io/ipns/tokens.uniswap.org" \
+		> data/tokens.json
+
+reset:
+	rm -rf data/*.parquet
+	rm -rf data/*.json
+	rm -rf data/prices
 
 filter-and-decode-swaps:
 	python src/filter_and_decode_swaps.py \
@@ -52,7 +64,7 @@ backtest:
 	python src/dex_contagion_trader.py \
 		--save-embeddings \
 		--epochs 50 \
-		--trading-days 3 
+		--trading-days 15
 
 modal-train:
 	uv run modal run src/modal_train.py \
@@ -82,11 +94,6 @@ ldr-tgn-trader:
 # 		--header "x-cg-pro-api-key: $$COINGECKO_API_KEY" \
 # 		> data/coins.json
 
-# ingest-tokens:
-# 	echo "Updating tokens.json..."	
-# 	curl --compressed -H 'Accept: application/json' \
-# 		"https://ipfs.io/ipns/tokens.uniswap.org" \
-# 		> data/tokens.json
 
 
 # Reference prices for validation notebook

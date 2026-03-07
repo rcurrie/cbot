@@ -15,7 +15,7 @@ trading.
 WHAT: Daily sliding backtest implementing:
 1. Train TGCN on 5 days of historical data + morning data (up to 9am)
 2. Predict top N tokens with highest probability of upward movement at 9am
-3. Execute equal-weighted long positions from 9am to 5pm
+3. Execute equal-weighted long positions from 9am to 5pm UTC
 4. Apply risk management (stop-loss at -20%, take-profit at +200%)
 5. Calculate returns and slide forward 1 day, retraining from scratch
 6. Aggregate performance metrics: Sharpe ratio, max drawdown, win rate
@@ -50,7 +50,7 @@ References:
 import json
 import logging
 import time
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -82,7 +82,7 @@ app = typer.Typer(
 
 # Backtest parameters
 TRAIN_WINDOW_DAYS = 5
-TRADE_WINDOW_HOURS = (9, 17)  # 9am to 5pm EST
+TRADE_WINDOW_HOURS = (9, 17)  # 9am to 5pm UTC
 TOP_N_TOKENS = 5
 SLIDE_STEP_DAYS = 1
 
@@ -888,19 +888,24 @@ def predict_top_tokens(
     le: LabelEncoder,
     device: str,
     top_n: int = 5,
+    warmup_cutoff_ms: int | None = None,
 ) -> list[tuple[str, float, float]]:
     """Predict top N tokens with Kelly criterion position sizing.
 
-    PHASE 2: Uses ternary classification probabilities to calculate optimal
-    position sizes via Kelly criterion: kelly_fraction = (P(up) - P(down)) / 2.
-    Only returns tokens with positive expected edge (P(up) > P(down)).
+    Uses warm-start inference: process the full temporal sequence through the
+    TGCN so hidden states accumulate context, but only collect predictions
+    from events after warmup_cutoff_ms. This avoids cold-start degradation
+    when predicting on a short out-of-sample window.
 
     Args:
         model: TokenPredictorModel instance.
-        data: DGData for inference.
+        data: DGData for inference (may include warmup events).
         le: LabelEncoder for decoding token IDs.
         device: Device for inference.
         top_n: Number of top tokens to return.
+        warmup_cutoff_ms: If set, only collect predictions from node
+            updates with timestamps >= this value. Earlier events warm
+            up the TGCN hidden states but are not used for predictions.
 
     Returns:
         List of (token_address, expected_return, kelly_fraction) tuples.
@@ -916,6 +921,8 @@ def predict_top_tokens(
     # Each token gets list of [P(down), P(stay), P(up)] probability vectors
     token_probabilities: dict[int, list[np.ndarray]] = {}
     total_batches = sum(1 for _ in loader)
+    warmup_batches = 0
+    predict_batches = 0
 
     # Prediction loop with periodic progress logging
     batches_processed = 0
@@ -932,13 +939,53 @@ def predict_top_tokens(
                 batches_processed += 1
                 continue
 
-            # Convert logits to probabilities using softmax
-            # Shape: [num_labeled_nodes, 3] where columns are [P(down), P(stay), P(up)]
-            probs = torch.softmax(logits, dim=1).cpu().numpy()
-
-            # Get node_ids for labeled nodes only
+            # Determine which nodes are in the prediction region
+            # (past the warmup cutoff). During warmup, the model
+            # processes events to build TGCN hidden states but we
+            # discard predictions from training-period events.
             has_label = batch_data.dynamic_node_feats[:, 3] != -999
-            labeled_node_ids = batch_data.node_ids[has_label].cpu().numpy()
+
+            if warmup_cutoff_ms is not None:
+                node_times = batch_data.node_times
+                in_predict_region = node_times >= warmup_cutoff_ms
+                # Only keep nodes that have labels AND are past cutoff
+                collect_mask = has_label & in_predict_region[
+                    : len(has_label)
+                ]
+                if not collect_mask.any():
+                    warmup_batches += 1
+                    batches_processed += 1
+                    continue
+            else:
+                collect_mask = has_label
+
+            predict_batches += 1
+
+            # Convert logits to probabilities using softmax
+            # Shape: [num_labeled_nodes, 3] where columns are
+            # [P(down), P(stay), P(up)]
+            # logits corresponds to has_label nodes, so we need to
+            # map collect_mask back to the logits indices
+            if warmup_cutoff_ms is not None:
+                # logits only has rows for has_label=True nodes,
+                # so we need the subset of those that are also in
+                # predict region
+                labeled_in_predict = in_predict_region[
+                    : len(has_label)
+                ][has_label]
+                probs = (
+                    torch.softmax(logits, dim=1)[labeled_in_predict]
+                    .cpu()
+                    .numpy()
+                )
+                labeled_node_ids = (
+                    batch_data.node_ids[collect_mask].cpu().numpy()
+                )
+            else:
+                probs = torch.softmax(logits, dim=1).cpu().numpy()
+                labeled_node_ids = (
+                    batch_data.node_ids[has_label].cpu().numpy()
+                )
 
             for node_id, prob_vector in zip(
                 labeled_node_ids,
@@ -961,6 +1008,13 @@ def predict_top_tokens(
                     total_batches,
                 )
 
+    if warmup_cutoff_ms is not None:
+        logger.info(
+            "  Warm-start: %d warmup batches, %d prediction batches",
+            warmup_batches,
+            predict_batches,
+        )
+
     # Calculate Kelly criterion position sizing for each token
     recommendations: list[tuple[str, float, float]] = []
     for node_id, prob_vectors in token_probabilities.items():
@@ -981,6 +1035,39 @@ def predict_top_tokens(
 
             token_addr = le.inverse_transform([node_id])[0]
             recommendations.append((token_addr, expected_return, kelly_fraction))
+
+    # Diagnostic: log distribution of model predictions across all tokens
+    if token_probabilities:
+        all_edges = []
+        all_p_ups = []
+        all_p_downs = []
+        for node_id, prob_vectors in token_probabilities.items():
+            avg_probs = np.mean(prob_vectors, axis=0)
+            all_p_downs.append(avg_probs[LABEL_DOWN])
+            all_p_ups.append(avg_probs[LABEL_UP])
+            all_edges.append(avg_probs[LABEL_UP] - avg_probs[LABEL_DOWN])
+        edges_arr = np.array(all_edges)
+        logger.info(
+            "Prediction diagnostics (%d tokens):", len(all_edges),
+        )
+        logger.info(
+            "  P(up):   min=%.3f  mean=%.3f  max=%.3f",
+            np.min(all_p_ups), np.mean(all_p_ups), np.max(all_p_ups),
+        )
+        logger.info(
+            "  P(down): min=%.3f  mean=%.3f  max=%.3f",
+            np.min(all_p_downs), np.mean(all_p_downs), np.max(all_p_downs),
+        )
+        logger.info(
+            "  Edge (P(up)-P(down)): min=%+.3f  mean=%+.3f  max=%+.3f",
+            np.min(edges_arr), np.mean(edges_arr), np.max(edges_arr),
+        )
+        positive_edge = np.sum(edges_arr > 0)
+        meets_kelly = np.sum(edges_arr >= 0.20)
+        logger.info(
+            "  Tokens with edge > 0: %d | edge >= 0.20 (Kelly 10%%): %d",
+            positive_edge, meets_kelly,
+        )
 
     # Sort by expected return descending (highest edge first)
     recommendations.sort(key=lambda x: x[1], reverse=True)
@@ -1191,7 +1278,7 @@ def backtest_slide(
     Each day:
     1. Train on 5 days of data up to 9am on trade day
     2. Predict top 5 tokens at 9am
-    3. Trade from 9am to 5pm
+    3. Trade from 9am to 5pm UTC
     4. Calculate returns
     5. Slide forward 1 day and retrain from scratch
 
@@ -1241,11 +1328,14 @@ def backtest_slide(
         logger.info("Trade Day: %s", trade_date)
         logger.info("=" * DIVIDER_LENGTH)
         logger.info(
-            "Training on: %s to %s (full days)",
+            "Training on: %s to %s",
             train_start_date,
             train_end_date,
         )
-        logger.info("Plus morning data on %s (up to 9am)", trade_date)
+        logger.info(
+            "Predicting on: %s morning (warm-start through training data)",
+            trade_date,
+        )
 
         # Initialize fresh model for this day
         model = TokenPredictorModel(
@@ -1257,29 +1347,26 @@ def backtest_slide(
         ).to(DEVICE)
 
         # Count events for logging
-        df_train_history = df.filter(
+        df_train_events = df.filter(
             (pl.col("trade_date") >= train_start_date)
             & (pl.col("trade_date") <= train_end_date),
         )
-        df_train_morning = df.filter(
+        df_predict_morning = df.filter(
             (pl.col("trade_date") == trade_date)
             & (pl.col("bar_close_timestamp").dt.hour() < TRADE_WINDOW_HOURS[0]),
         )
 
-        total_train_events = len(df_train_history) + len(df_train_morning)
         logger.info(
-            "Training events: %s (history) + %s (morning) = %s total",
-            f"{len(df_train_history):,}",
-            f"{len(df_train_morning):,}",
-            f"{total_train_events:,}",
+            "Training events: %s | Prediction events (morning): %s",
+            f"{len(df_train_events):,}",
+            f"{len(df_predict_morning):,}",
         )
 
-        # For training, we'll use the combined window
+        # Train on historical days only (no trade-day data)
         data_train = build_window(
             df,
             start_date=train_start_date,
-            end_date=trade_date,
-            end_hour=TRADE_WINDOW_HOURS[0],  # Up to 9am
+            end_date=train_end_date,
         )
 
         # Train model from scratch
@@ -1299,13 +1386,77 @@ def backtest_slide(
                 Path("data/embeddings"),
             )
 
-        # Predict at 9am using all training data (including morning)
+        # Warm-start prediction: feed training data + morning data as
+        # one continuous sequence. The TGCN hidden states warm up through
+        # the training period, then make predictions on the morning data.
+        # This avoids cold-start degradation while remaining out-of-sample
+        # (model weights were trained on the training data, but predictions
+        # are only collected from the unseen morning events).
+        if len(df_predict_morning) == 0:
+            logger.warning(
+                "No morning data for %s, skipping trading day",
+                trade_date,
+            )
+            results.append(
+                {
+                    "train_start": train_start_date,
+                    "train_end": train_end_date,
+                    "trade_date": trade_date,
+                    "top_tokens": [],
+                    "token_returns": {},
+                    "portfolio_return": 0.0,
+                },
+            )
+            continue
+
+        # Build combined window: training days + trade day morning
+        data_predict = build_window(
+            df,
+            start_date=train_start_date,
+            end_date=trade_date,
+            end_hour=TRADE_WINDOW_HOURS[0],  # Up to 9am on trade day
+        )
+
+        # Calculate warmup cutoff: timestamp (ms) where training ends
+        # and prediction begins. The combined window starts at the first
+        # training event. We compute the ms offset of the first morning
+        # event relative to that start, which is the cutoff in DGData's
+        # relative timestamp space.
+        df_combined = df.filter(
+            (pl.col("trade_date") >= train_start_date)
+            & (pl.col("trade_date") <= trade_date)
+            & (
+                (pl.col("trade_date") < trade_date)
+                | (
+                    pl.col("bar_close_timestamp").dt.hour()
+                    < TRADE_WINDOW_HOURS[0]
+                )
+            ),
+        ).sort("bar_close_timestamp")
+        first_ts = df_combined["bar_close_timestamp"][0]
+        # Find the first morning event timestamp
+        first_morning_ts = df_predict_morning.sort(
+            "bar_close_timestamp",
+        )["bar_close_timestamp"][0]
+        # Convert to ms offset from window start
+        warmup_cutoff_ms = int(
+            (first_morning_ts - first_ts)
+            / timedelta(milliseconds=1)
+        )
+
+        logger.info(
+            "Warm-start: %s training events, cutoff at %d ms",
+            f"{len(df_train_events):,}",
+            warmup_cutoff_ms,
+        )
+
         top_tokens = predict_top_tokens(
             model,
-            data_train,  # Use same data we trained on for prediction
+            data_predict,
             le,
             DEVICE,
             top_n=TOP_N_TOKENS,
+            warmup_cutoff_ms=warmup_cutoff_ms,
         )
 
         logger.info(
@@ -1328,14 +1479,14 @@ def backtest_slide(
             )
             continue
 
-        # Calculate returns during trading window (9am-5pm)
+        # Calculate returns during trading window (9am-5pm UTC)
         df_trading = df.filter(
             (pl.col("trade_date") == trade_date)
             & (pl.col("bar_close_timestamp").dt.hour() >= TRADE_WINDOW_HOURS[0])
             & (pl.col("bar_close_timestamp").dt.hour() < TRADE_WINDOW_HOURS[1]),
         )
 
-        logger.info("Trading window events (9am-5pm): %s", f"{len(df_trading):,}")
+        logger.info("Trading window events (9am-5pm UTC): %s", f"{len(df_trading):,}")
 
         if len(df_trading) == 0:
             logger.warning("No trading data for %s, skipping", trade_date)
@@ -1364,20 +1515,16 @@ def backtest_slide(
                 daily_return * 100,
             )
 
-        # Calculate Kelly-weighted portfolio return
-        # Each position contributes: position_size * token_return
+        # Calculate Kelly-weighted portfolio return on TOTAL capital
+        # Each position contributes: kelly_fraction * token_return
+        # Result is return on total capital (not return on deployed capital)
+        # This gives accurate Sharpe ratio regardless of position sizing
         total_position_size = sum(
             kelly_frac for _, _, kelly_frac in top_tokens
         )
-        weighted_return = sum(
+        portfolio_return = sum(
             ret * size
             for ret, size in token_returns.values()
-        )
-        # Normalize by total position size (may be < 1.0 if not fully invested)
-        portfolio_return = (
-            weighted_return / total_position_size
-            if total_position_size > 0
-            else 0.0
         )
         logger.info(
             "Portfolio return: %+.2f%% (%.1f%% capital deployed)",
@@ -1435,7 +1582,7 @@ def main(
     Each day:
     - Train on 5 days up to 9am
     - Predict top 5 tokens at 9am
-    - Trade from 9am to 5pm
+    - Trade from 9am to 5pm UTC
     - Slide forward 1 day and retrain from scratch
     """
     # Validate input data

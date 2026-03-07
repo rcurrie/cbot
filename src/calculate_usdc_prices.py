@@ -807,8 +807,12 @@ def calculate_usdc_prices(  # noqa: PLR0915, C901, PLR0912
     else:
         logger.info("Processing direct USDC swaps only (indirect inference disabled)")
 
-    # Price cache: token_address -> (USDC price, timestamp)
-    # Includes timestamp to detect stale prices
+    # Price cache: token_address -> (USDC price, origin_timestamp)
+    # origin_timestamp tracks when the price was first directly
+    # observed from a USDC pair. For indirect (inferred) prices,
+    # this inherits the oldest origin from the cached prices used
+    # in the inference, so the TTL correctly reflects the true
+    # freshness of the underlying data.
     price_cache: dict[str, tuple[float, datetime]] = {}
     # USDC = 1 USDC
     price_cache[USDC_ADDRESS.lower()] = (1.0, datetime.min.replace(tzinfo=UTC))
@@ -971,9 +975,11 @@ def calculate_usdc_prices(  # noqa: PLR0915, C901, PLR0912
                             skipped_swap_count += 1
                             continue
 
-                        # Estimate USDC volume using token0 side only
-                        # (avoid double-counting)
+                        # Estimate USDC volume using token0 side, split
+                        # between the two token records to avoid
+                        # double-counting in downstream bar accumulation
                         usdc_volume_estimate = amount0_real * inferred_token0_price
+                        usdc_volume_per_token = usdc_volume_estimate / 2.0
 
                         # Sanity check volume
                         if usdc_volume_estimate > MAX_SANE_VOLUME:
@@ -981,14 +987,18 @@ def calculate_usdc_prices(  # noqa: PLR0915, C901, PLR0912
                             skipped_swap_count += 1
                             continue
 
-                        # Update cache with inferred prices and timestamp
+                        # Update cache with inferred prices, inheriting
+                        # the oldest origin timestamp from the two cached
+                        # prices used in the inference so TTL correctly
+                        # reflects the true freshness of the underlying data
+                        oldest_origin = min(token0_time, token1_time)
                         price_cache[token1_addr] = (
                             inferred_token1_price,
-                            current_timestamp,
+                            oldest_origin,
                         )
                         price_cache[token0_addr] = (
                             inferred_token0_price,
-                            current_timestamp,
+                            oldest_origin,
                         )
 
                         # Add price observations for BOTH tokens
@@ -1000,7 +1010,7 @@ def calculate_usdc_prices(  # noqa: PLR0915, C901, PLR0912
                                 "pool": row["pool"],
                                 "token_address": token0_addr,
                                 "price_in_usdc": inferred_token0_price,
-                                "usdc_volume": usdc_volume_estimate,
+                                "usdc_volume": usdc_volume_per_token,
                             },
                         )
                         decoded_data.append(
@@ -1011,7 +1021,7 @@ def calculate_usdc_prices(  # noqa: PLR0915, C901, PLR0912
                                 "pool": row["pool"],
                                 "token_address": token1_addr,
                                 "price_in_usdc": inferred_token1_price,
-                                "usdc_volume": usdc_volume_estimate,
+                                "usdc_volume": usdc_volume_per_token,
                             },
                         )
                         indirect_swap_count += 1

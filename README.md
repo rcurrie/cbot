@@ -54,7 +54,9 @@ Very strict typing and style defined in AGENTS.md
 
 ### TGCN Trader (`dex_contagion_trader.py`)
 
-Temporal Graph Convolutional Network with ternary classification and Kelly criterion position sizing. Trains daily on a 5-day sliding window, retraining from scratch each day to prevent look-ahead bias. Position size = (P(up) - P(down)) / 2, only entering when the model detects positive edge.
+Temporal Graph Convolutional Network with ternary classification and Kelly criterion position sizing. Walk-forward backtest: train on 5-day sliding window, predict on held-out morning data with warm-start inference (TGCN hidden states accumulate through training sequence before reaching prediction events), trade 9am-5pm UTC.
+
+**Result: Null.** A thorough pipeline audit found and fixed several bugs (volume double-counting in indirect price inference, stale cache TTL propagation, in-sample prediction bias inflating Sharpe). With those corrected, the model produces max edge of ~5% (P(up) - P(down)) on out-of-sample data — far below the 20% Kelly threshold, and well within noise after transaction costs. Training loss barely decreases (0.103 → 0.102), confirming the TGCN isn't learning discriminative patterns that generalize beyond its training window. The previous apparent alpha was entirely in-sample overfitting.
 
 ### Heterogeneous GATv2 (`ldr_tgn_trader.py`)
 
